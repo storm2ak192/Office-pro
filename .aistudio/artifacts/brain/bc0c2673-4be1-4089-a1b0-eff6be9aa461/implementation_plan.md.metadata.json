@@ -1,0 +1,6 @@
+{
+  "summary": "خطة تنفيذ متكاملة لبناء تطبيق Office Pro المكتبي الاحترافي على Android باستخدام Kotlin وJetpack Compose، مع محررات حقيقية لملفات Word وExcel وPowerPoint وPDF، ومركز تحويل الملفات، والماسح الضوئي OCR، ومساعد الذكاء الاصطناعي الاختياري عبر Firebase AI Logic، ومكتبة القوالب، وإدارة الملفات المحلية.",
+  "updatedAt": "2026-11-05T10:54:26.694931383Z",
+  "requestFeedback": true,
+  "userFacing": true
+}

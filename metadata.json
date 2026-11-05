@@ -1,0 +1,6 @@
+{
+  "name": "Office Pro",
+  "description": "تطبيق مكتبي احترافي متكامل لتحرير المستندات والجداول والعروض التقديمية وملفات PDF على أندرويد",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
