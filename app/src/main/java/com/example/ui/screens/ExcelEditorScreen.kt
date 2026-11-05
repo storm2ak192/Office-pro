@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -33,8 +34,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.core.DocumentMode
 import com.example.core.FileUtils
 import com.example.core.LocalAppStrings
+import com.example.core.SafeSaveResult
+import com.example.core.SaveState
 import com.example.data.OfficeRepository
 import com.example.engine.*
 import com.example.ui.theme.CairoFontFamily
@@ -58,17 +62,29 @@ fun ExcelEditorScreen(
     val scope = rememberCoroutineScope()
     val file = remember(filePath) { File(filePath) }
 
+    var mode by remember { mutableStateOf(DocumentMode.VIEW) }
     var workbook by remember { mutableStateOf(ExcelWorkbookModel()) }
     var selectedRow by remember { mutableIntStateOf(0) }
     var selectedCol by remember { mutableIntStateOf(0) }
     var undoStack by remember { mutableStateOf<List<ExcelWorkbookModel>>(emptyList()) }
     var redoStack by remember { mutableStateOf<List<ExcelWorkbookModel>>(emptyList()) }
     var isUnsaved by remember { mutableStateOf(false) }
+    var saveState by remember { mutableStateOf<SaveState>(SaveState.Saved) }
     var showChartSheet by remember { mutableStateOf(false) }
     var showFindReplace by remember { mutableStateOf(false) }
     var showConditionalDialog by remember { mutableStateOf(false) }
     var showValidationDialog by remember { mutableStateOf(false) }
+    var showExitConfirmDialog by remember { mutableStateOf(false) }
+    var showSaveAsDialog by remember { mutableStateOf(false) }
     var statusToast by remember { mutableStateOf<String?>(null) }
+
+    BackHandler(enabled = isUnsaved || mode == DocumentMode.EDIT) {
+        if (isUnsaved) {
+            showExitConfirmDialog = true
+        } else if (mode == DocumentMode.EDIT) {
+            mode = DocumentMode.VIEW
+        }
+    }
 
     LaunchedEffect(filePath) {
         val loaded = withContext(Dispatchers.IO) {
@@ -90,6 +106,7 @@ fun ExcelEditorScreen(
             })
         } else newWb
         isUnsaved = true
+        saveState = SaveState.Unsaved
     }
 
     fun updateActiveSheet(transform: (ExcelSheet) -> ExcelSheet) {
@@ -108,14 +125,28 @@ fun ExcelEditorScreen(
         }
     }
 
-    fun saveNow() {
+    fun saveNow(onSaved: (() -> Unit)? = null) {
         scope.launch {
-            withContext(Dispatchers.IO) {
-                ExcelEngine.saveWorkbook(file, workbook)
-                repository.registerOrUpdateFile(file, markOpened = true)
+            saveState = SaveState.Saving
+            val res = withContext(Dispatchers.IO) {
+                val r = ExcelEngine.saveWorkbook(file, workbook, context)
+                if (r is SafeSaveResult.Success) {
+                    repository.registerOrUpdateFile(file, markOpened = true)
+                }
+                r
             }
-            isUnsaved = false
-            statusToast = strings.saved
+            when (res) {
+                is SafeSaveResult.Success -> {
+                    isUnsaved = false
+                    saveState = SaveState.Saved
+                    statusToast = strings.saved
+                    onSaved?.invoke()
+                }
+                is SafeSaveResult.Failure -> {
+                    saveState = SaveState.Failed(res.message)
+                    statusToast = res.message
+                }
+            }
         }
     }
 
@@ -133,8 +164,7 @@ fun ExcelEditorScreen(
             TopAppBar(
                 navigationIcon = {
                     IconButton(onClick = {
-                        if (isUnsaved) saveNow()
-                        onBack()
+                        if (isUnsaved) showExitConfirmDialog = true else onBack()
                     }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
@@ -142,45 +172,68 @@ fun ExcelEditorScreen(
                 title = {
                     Column {
                         Text(file.name, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                        val modeLabel = if (mode == DocumentMode.VIEW) "وضع العرض" else "وضع التحرير"
+                        val stateLabel = when (saveState) {
+                            is SaveState.Saved -> strings.saved
+                            is SaveState.Unsaved -> strings.unsaved
+                            is SaveState.Saving -> strings.saving
+                            is SaveState.Failed -> "فشل الحفظ"
+                        }
                         Text(
-                            text = if (isUnsaved) strings.unsaved else strings.saved,
+                            text = "$modeLabel • $stateLabel",
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (isUnsaved) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 actions = {
-                    IconButton(
-                        enabled = undoStack.isNotEmpty(),
-                        onClick = {
-                            val prev = undoStack.last()
-                            undoStack = undoStack.dropLast(1)
-                            redoStack = redoStack + workbook
-                            workbook = prev
-                            isUnsaved = true
+                    if (mode == DocumentMode.VIEW) {
+                        if (!workbook.isReadOnlyBinary) {
+                            FilledTonalButton(
+                                onClick = { mode = DocumentMode.EDIT },
+                                modifier = Modifier.testTag("excel_edit_mode_btn"),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("تحرير")
+                            }
                         }
-                    ) { Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = strings.undo) }
+                    } else {
+                        IconButton(
+                            enabled = undoStack.isNotEmpty(),
+                            onClick = {
+                                val prev = undoStack.last()
+                                undoStack = undoStack.dropLast(1)
+                                redoStack = redoStack + workbook
+                                workbook = prev
+                                isUnsaved = true
+                                saveState = SaveState.Unsaved
+                            }
+                        ) { Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = strings.undo) }
 
-                    IconButton(
-                        enabled = redoStack.isNotEmpty(),
-                        onClick = {
-                            val next = redoStack.last()
-                            redoStack = redoStack.dropLast(1)
-                            undoStack = undoStack + workbook
-                            workbook = next
-                            isUnsaved = true
-                        }
-                    ) { Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = strings.redo) }
+                        IconButton(
+                            enabled = redoStack.isNotEmpty(),
+                            onClick = {
+                                val next = redoStack.last()
+                                redoStack = redoStack.dropLast(1)
+                                undoStack = undoStack + workbook
+                                workbook = next
+                                isUnsaved = true
+                                saveState = SaveState.Unsaved
+                            }
+                        ) { Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = strings.redo) }
+
+                        IconButton(
+                            onClick = { saveNow() },
+                            modifier = Modifier.testTag("save_excel_btn")
+                        ) { Icon(Icons.Default.Save, contentDescription = strings.save) }
+                    }
 
                     IconButton(
                         onClick = { showChartSheet = true },
                         modifier = Modifier.testTag("excel_chart_btn")
                     ) { Icon(Icons.Default.BarChart, contentDescription = "Charts") }
-
-                    IconButton(
-                        onClick = { saveNow() },
-                        modifier = Modifier.testTag("save_excel_btn")
-                    ) { Icon(Icons.Default.Save, contentDescription = strings.save) }
 
                     var moreMenu by remember { mutableStateOf(false) }
                     Box {
@@ -188,6 +241,16 @@ fun ExcelEditorScreen(
                             Icon(Icons.Default.MoreVert, contentDescription = "More")
                         }
                         DropdownMenu(expanded = moreMenu, onDismissRequest = { moreMenu = false }) {
+                            if (mode == DocumentMode.EDIT) {
+                                DropdownMenuItem(
+                                    text = { Text("معاينة (وضع العرض)") },
+                                    onClick = { moreMenu = false; mode = DocumentMode.VIEW }
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("حفظ باسم (نسخة جديدة)") },
+                                onClick = { moreMenu = false; showSaveAsDialog = true }
+                            )
                             DropdownMenuItem(
                                 text = { Text("+ إضافة صف") },
                                 onClick = {
@@ -279,6 +342,36 @@ fun ExcelEditorScreen(
                 .fillMaxSize()
                 .padding(padding)
         ) {
+            if (workbook.isReadOnlyBinary) {
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            "ملف XLSB ثنائي (وضع القراءة فقط)",
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(onClick = {
+                            scope.launch(Dispatchers.IO) {
+                                val out = FileUtils.ensureUniqueFile(file.parentFile!!, "${file.nameWithoutExtension}.xlsx")
+                                val res = ExcelEngine.saveWorkbook(out, workbook.copy(isReadOnlyBinary = false), context)
+                                if (res is SafeSaveResult.Success) {
+                                    repository.registerOrUpdateFile(out, markOpened = false)
+                                    statusToast = "تم الحفظ كـ ${out.name} للتحرير الكامل"
+                                }
+                            }
+                        }) { Text("حفظ كـ XLSX") }
+                    }
+                }
+            }
+
+            if (mode == DocumentMode.EDIT) {
             // Formula Bar
             Surface(tonalElevation = 2.dp, modifier = Modifier.fillMaxWidth()) {
                 Row(
@@ -372,6 +465,7 @@ fun ExcelEditorScreen(
                         )
                     }
                 )
+            }
             }
 
             // Dropdown validation quick selector if cell has validation
@@ -732,6 +826,70 @@ fun ExcelEditorScreen(
                 }) { Text(strings.confirm) }
             },
             dismissButton = { TextButton(onClick = { showValidationDialog = false }) { Text(strings.cancel) } }
+        )
+    }
+
+    if (showExitConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showExitConfirmDialog = false },
+            title = { Text("تغييرات غير محفوظة") },
+            text = { Text("هل تريد حفظ التغييرات قبل الخروج من جدول البيانات؟") },
+            confirmButton = {
+                Button(onClick = {
+                    showExitConfirmDialog = false
+                    saveNow { onBack() }
+                }) { Text("حفظ التغييرات") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            showExitConfirmDialog = false
+                            onBack()
+                        },
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) { Text("تجاهل التغييرات") }
+                    TextButton(onClick = { showExitConfirmDialog = false }) { Text(strings.cancel) }
+                }
+            }
+        )
+    }
+
+    if (showSaveAsDialog) {
+        val ext = if (file.extension.equals("csv", true)) "csv" else "xlsx"
+        var newName by remember { mutableStateOf("${file.nameWithoutExtension}_copy.$ext") }
+        AlertDialog(
+            onDismissRequest = { showSaveAsDialog = false },
+            title = { Text("حفظ باسم") },
+            text = {
+                OutlinedTextField(
+                    value = newName,
+                    onValueChange = { newName = it },
+                    label = { Text("اسم الملف الجديد") },
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val targetName = if (newName.contains('.')) newName else "$newName.$ext"
+                    showSaveAsDialog = false
+                    scope.launch(Dispatchers.IO) {
+                        val dest = FileUtils.ensureUniqueFile(file.parentFile!!, targetName)
+                        val res = ExcelEngine.saveWorkbook(dest, workbook.copy(isReadOnlyBinary = false), context)
+                        withContext(Dispatchers.Main) {
+                            if (res is SafeSaveResult.Success) {
+                                repository.registerOrUpdateFile(res.savedFile, markOpened = false)
+                                statusToast = "تم الحفظ باسم ${res.savedFile.name}"
+                            } else if (res is SafeSaveResult.Failure) {
+                                statusToast = res.message
+                            }
+                        }
+                    }
+                }) { Text(strings.save) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSaveAsDialog = false }) { Text(strings.cancel) }
+            }
         )
     }
 }

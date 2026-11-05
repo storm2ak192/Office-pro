@@ -1,5 +1,6 @@
 package com.example.engine
 
+import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -8,17 +9,19 @@ import android.graphics.pdf.PdfDocument
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
+import android.util.Base64
+import com.example.core.DocumentDetector
+import com.example.core.DetectedFormat
+import com.example.core.OoxmlPackage
+import com.example.core.SafeSaveManager
+import com.example.core.SafeSaveResult
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.UUID
-import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
-import java.util.zip.ZipOutputStream
 
 @Serializable
 enum class WordAlignment { RIGHT, CENTER, LEFT, JUSTIFY }
@@ -94,32 +97,43 @@ data class WordDocumentModel(
     val showPageNumbers: Boolean = true,
     val paragraphs: List<WordParagraph> = listOf(WordParagraph(text = "")),
     val tables: List<WordTable> = emptyList(),
-    val shapes: List<WordShape> = emptyList()
+    val shapes: List<WordShape> = emptyList(),
+    @Transient val sourcePackage: OoxmlPackage? = null
 )
 
 object WordEngine {
 
     fun loadDocument(file: File): WordDocumentModel {
-        return when (file.extension.lowercase()) {
-            "docx" -> readDocx(file)
-            "rtf" -> readRtf(file)
-            "txt" -> readTxt(file)
-            "doc" -> readLegacyDoc(file)
+        val detected = DocumentDetector.detect(file).format
+        return when (detected) {
+            DetectedFormat.DOCX, DetectedFormat.DOTX -> readDocx(file)
+            DetectedFormat.ODT -> readOdt(file)
+            DetectedFormat.RTF -> readRtf(file)
+            DetectedFormat.TXT -> readTxt(file)
+            DetectedFormat.DOC, DetectedFormat.DOT -> readLegacyDoc(file)
             else -> readTxt(file)
         }
     }
 
-    fun saveDocument(file: File, doc: WordDocumentModel) {
-        when (file.extension.lowercase()) {
-            "docx" -> writeDocx(file, doc)
-            "rtf" -> writeRtf(file, doc)
-            "txt" -> writeTxt(file, doc)
-            else -> writeDocx(file, doc)
+    fun saveDocument(file: File, doc: WordDocumentModel, context: Context? = null): SafeSaveResult {
+        val ext = file.extension.lowercase()
+        val validator: ((File) -> Boolean)? = when (ext) {
+            "docx", "dotx", "odt" -> { f -> OoxmlPackage.isValidZip(f) }
+            else -> null
+        }
+        return SafeSaveManager.saveAtomically(file, context, validator) { tempOut ->
+            when (ext) {
+                "docx", "dotx" -> writeDocx(tempOut, doc)
+                "odt" -> writeOdt(tempOut, doc)
+                "rtf" -> writeRtf(tempOut, doc)
+                "txt" -> writeTxt(tempOut, doc)
+                else -> writeDocx(tempOut, doc)
+            }
         }
     }
 
     private fun readTxt(file: File): WordDocumentModel {
-        val content = file.readText(Charsets.UTF_8).removeSuffix("\n")
+        val content = if (file.exists()) file.readText(Charsets.UTF_8).removeSuffix("\n") else ""
         val lines = content.split("\n")
         val paragraphs = if (lines.isEmpty()) {
             listOf(WordParagraph())
@@ -174,7 +188,6 @@ object WordEngine {
             val c = raw[i]
             if (c == '\\') {
                 if (i + 2 < raw.length && raw[i + 1] == 'u' && (raw[i + 2].isDigit() || raw[i + 2] == '-')) {
-                    // Unicode escape \uN?
                     val endIdx = raw.indexOf('?', i + 2)
                     if (endIdx != -1) {
                         val code = raw.substring(i + 2, endIdx).trim().toIntOrNull()
@@ -191,10 +204,9 @@ object WordEngine {
                     val param = match.groupValues[2]
                     when (cmd) {
                         "par", "line" -> {
-                            val text = current.toString()
                             paragraphs.add(
                                 WordParagraph(
-                                    text = text,
+                                    text = current.toString(),
                                     isBold = isBold,
                                     isItalic = isItalic,
                                     isUnderline = isUnderline,
@@ -270,7 +282,6 @@ object WordEngine {
     }
 
     private fun readLegacyDoc(file: File): WordDocumentModel {
-        // Extract readable UTF-16LE and ASCII/Arabic text runs from legacy binary .doc
         val bytes = file.readBytes()
         val sb = StringBuilder()
         var i = 0
@@ -306,29 +317,95 @@ object WordEngine {
         return WordDocumentModel(title = file.nameWithoutExtension, paragraphs = paragraphs)
     }
 
+    private fun readOdt(file: File): WordDocumentModel {
+        val pkg = OoxmlPackage.readFrom(file)
+        val contentXml = pkg.getEntry("content.xml")
+        val paragraphs = mutableListOf<WordParagraph>()
+        if (contentXml != null) {
+            val parser = XmlPullParserFactory.newInstance().newPullParser()
+            parser.setInput(contentXml.inputStream(), "UTF-8")
+            var event = parser.eventType
+            while (event != XmlPullParser.END_DOCUMENT) {
+                val tag = parser.name?.substringAfter(':') ?: ""
+                if (event == XmlPullParser.START_TAG && (tag == "p" || tag == "h")) {
+                    val txt = readElementTextRecursive(parser, tag)
+                    val isAr = txt.any { it in '\u0600'..'\u06FF' }
+                    paragraphs.add(
+                        WordParagraph(
+                            text = txt,
+                            style = if (tag == "h") WordStyle.HEADING_1 else WordStyle.NORMAL,
+                            isBold = tag == "h",
+                            isRtl = isAr,
+                            alignment = if (isAr) WordAlignment.RIGHT else WordAlignment.LEFT
+                        )
+                    )
+                }
+                event = parser.next()
+            }
+        }
+        if (paragraphs.isEmpty()) paragraphs.add(WordParagraph(text = ""))
+        return WordDocumentModel(
+            title = file.nameWithoutExtension,
+            paragraphs = paragraphs,
+            sourcePackage = pkg
+        )
+    }
+
+    private fun readElementTextRecursive(parser: XmlPullParser, endTag: String): String {
+        val sb = StringBuilder()
+        var depth = 1
+        while (depth > 0) {
+            when (parser.next()) {
+                XmlPullParser.START_TAG -> depth++
+                XmlPullParser.END_TAG -> depth--
+                XmlPullParser.TEXT -> sb.append(parser.text)
+                XmlPullParser.END_DOCUMENT -> break
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun writeOdt(file: File, doc: WordDocumentModel) {
+        val pkg = doc.sourcePackage?.copy() ?: OoxmlPackage()
+        if (!pkg.hasEntry("mimetype")) {
+            pkg.putEntry("mimetype", "application/vnd.oasis.opendocument.text".toByteArray(Charsets.UTF_8))
+        }
+        val bodyXml = doc.paragraphs.joinToString("\n") { p ->
+            val tag = if (p.style == WordStyle.HEADING_1 || p.style == WordStyle.HEADING_2) "text:h" else "text:p"
+            "      <$tag>${escapeXml(p.text)}</$tag>"
+        }
+        val contentXml = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2">
+  <office:body>
+    <office:text>
+$bodyXml
+    </office:text>
+  </office:body>
+</office:document-content>"""
+        pkg.putEntry("content.xml", contentXml.toByteArray(Charsets.UTF_8))
+        pkg.writeTo(file)
+    }
+
     private fun readDocx(file: File): WordDocumentModel {
+        val pkg = OoxmlPackage.readFrom(file)
         val paragraphs = mutableListOf<WordParagraph>()
         val tables = mutableListOf<WordTable>()
-        var headerText = ""
-        var footerText = ""
 
-        ZipInputStream(FileInputStream(file)).use { zip ->
-            var entry: ZipEntry? = zip.nextEntry
-            while (entry != null) {
-                when (entry.name) {
-                    "word/document.xml" -> {
-                        val xmlBytes = zip.readBytes()
-                        parseDocumentXml(xmlBytes, paragraphs, tables)
-                    }
-                    "word/header1.xml" -> {
-                        headerText = extractSimpleXmlText(zip.readBytes())
-                    }
-                    "word/footer1.xml" -> {
-                        footerText = extractSimpleXmlText(zip.readBytes())
-                    }
+        pkg.getEntry("word/document.xml")?.let { xmlBytes ->
+            parseDocumentXml(xmlBytes, paragraphs, tables)
+        }
+        val headerText = pkg.getEntry("word/header1.xml")?.let { extractSimpleXmlText(it) } ?: ""
+        val footerText = pkg.getEntry("word/footer1.xml")?.let { extractSimpleXmlText(it) } ?: ""
+
+        // Extract embedded images from word/media/* if no inline image paragraphs were added
+        val mediaEntries = pkg.listEntries("word/media/")
+        if (mediaEntries.isNotEmpty() && paragraphs.none { it.imageBase64 != null }) {
+            mediaEntries.take(6).forEach { mediaPath ->
+                val bytes = pkg.getEntry(mediaPath) ?: return@forEach
+                val b64 = runCatching { Base64.encodeToString(bytes, Base64.NO_WRAP) }.getOrNull()
+                if (!b64.isNullOrBlank()) {
+                    paragraphs.add(WordParagraph(text = "", imageBase64 = b64))
                 }
-                zip.closeEntry()
-                entry = zip.nextEntry
             }
         }
 
@@ -341,7 +418,8 @@ object WordEngine {
             headerText = headerText,
             footerText = footerText,
             paragraphs = paragraphs,
-            tables = tables
+            tables = tables,
+            sourcePackage = pkg
         )
     }
 
@@ -550,10 +628,11 @@ object WordEngine {
     }
 
     private fun writeDocx(file: File, doc: WordDocumentModel) {
-        ZipOutputStream(FileOutputStream(file)).use { zip ->
-            // 1. [Content_Types].xml
-            zip.putNextEntry(ZipEntry("[Content_Types].xml"))
-            zip.write(
+        val pkg = doc.sourcePackage?.copy() ?: OoxmlPackage()
+
+        if (!pkg.hasEntry("[Content_Types].xml")) {
+            pkg.putEntry(
+                "[Content_Types].xml",
                 """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -563,51 +642,45 @@ object WordEngine {
   <Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/>
 </Types>""".toByteArray(Charsets.UTF_8)
             )
-            zip.closeEntry()
-
-            // 2. _rels/.rels
-            zip.putNextEntry(ZipEntry("_rels/.rels"))
-            zip.write(
+        }
+        if (!pkg.hasEntry("_rels/.rels")) {
+            pkg.putEntry(
+                "_rels/.rels",
                 """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
 </Relationships>""".toByteArray(Charsets.UTF_8)
             )
-            zip.closeEntry()
-
-            // 3. word/_rels/document.xml.rels
-            zip.putNextEntry(ZipEntry("word/_rels/document.xml.rels"))
-            zip.write(
+        }
+        if (!pkg.hasEntry("word/_rels/document.xml.rels")) {
+            pkg.putEntry(
+                "word/_rels/document.xml.rels",
                 """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rIdHeader" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
   <Relationship Id="rIdFooter" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>
 </Relationships>""".toByteArray(Charsets.UTF_8)
             )
-            zip.closeEntry()
-
-            // 4. word/header1.xml & word/footer1.xml
-            zip.putNextEntry(ZipEntry("word/header1.xml"))
-            zip.write(buildHeaderFooterXml(doc.headerText).toByteArray(Charsets.UTF_8))
-            zip.closeEntry()
-
-            zip.putNextEntry(ZipEntry("word/footer1.xml"))
-            zip.write(buildHeaderFooterXml(doc.footerText).toByteArray(Charsets.UTF_8))
-            zip.closeEntry()
-
-            // 5. word/document.xml
-            zip.putNextEntry(ZipEntry("word/document.xml"))
-            zip.write(buildDocumentXml(doc).toByteArray(Charsets.UTF_8))
-            zip.closeEntry()
         }
+
+        if (doc.headerText.isNotEmpty() || pkg.hasEntry("word/header1.xml")) {
+            pkg.putEntry("word/header1.xml", buildHeaderFooterXml(doc.headerText, isFooter = false).toByteArray(Charsets.UTF_8))
+        }
+        if (doc.footerText.isNotEmpty() || pkg.hasEntry("word/footer1.xml")) {
+            pkg.putEntry("word/footer1.xml", buildHeaderFooterXml(doc.footerText, isFooter = true).toByteArray(Charsets.UTF_8))
+        }
+
+        pkg.putEntry("word/document.xml", buildDocumentXml(doc).toByteArray(Charsets.UTF_8))
+        pkg.writeTo(file)
     }
 
-    private fun buildHeaderFooterXml(text: String): String {
+    private fun buildHeaderFooterXml(text: String, isFooter: Boolean): String {
         val escaped = escapeXml(text)
+        val rootTag = if (isFooter) "w:ftr" else "w:hdr"
         return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<$rootTag xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:p><w:r><w:t xml:space="preserve">$escaped</w:t></w:r></w:p>
-</w:hdr>"""
+</$rootTag>"""
     }
 
     private fun buildDocumentXml(doc: WordDocumentModel): String {
@@ -660,7 +733,6 @@ object WordEngine {
             sb.append("        <w:t xml:space=\"preserve\">$fullText</w:t>\n")
             sb.append("      </w:r>\n    </w:p>\n")
 
-            // Append any tables anchored after this paragraph
             doc.tables.filter { it.afterParagraphIndex == index }.forEach { tbl ->
                 sb.append("    <w:tbl>\n")
                 tbl.rows.forEach { row ->
@@ -686,8 +758,6 @@ object WordEngine {
         val mTwips = doc.marginPt * 20
         sb.append(
             """    <w:sectPr>
-      <w:headerReference w:type="default" w:id="rIdHeader"/>
-      <w:footerReference w:type="default" w:id="rIdFooter"/>
       <w:pgSz w:w="$wTwips" w:h="$hTwips"/>
       <w:pgMar w:top="$mTwips" w:right="$mTwips" w:bottom="$mTwips" w:left="$mTwips"/>
     </w:sectPr>
@@ -729,8 +799,7 @@ object WordEngine {
                 c.drawText(doc.footerText, margin, pageHeight - margin * 0.4f, hfPaint)
             }
             if (doc.showPageNumbers) {
-                val pLabel = "$pNum"
-                c.drawText(pLabel, pageWidth - margin - 20f, pageHeight - margin * 0.4f, hfPaint)
+                c.drawText("$pNum", pageWidth - margin - 20f, pageHeight - margin * 0.4f, hfPaint)
             }
         }
 
@@ -796,7 +865,6 @@ object WordEngine {
             canvas.restore()
             y += staticLayout.height + doc.paragraphSpacingPt
 
-            // Render tables anchored after this paragraph
             doc.tables.filter { it.afterParagraphIndex == idx }.forEach { tbl ->
                 val rowH = 26f
                 tbl.rows.forEach { row ->

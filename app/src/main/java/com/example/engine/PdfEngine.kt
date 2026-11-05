@@ -5,6 +5,8 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
 import android.os.ParcelFileDescriptor
+import com.example.core.SafeSaveManager
+import com.example.core.SafeSaveResult
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.multipdf.PDFMergerUtility
 import com.tom_roush.pdfbox.pdmodel.PDDocument
@@ -12,95 +14,125 @@ import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
 import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
 import com.tom_roush.pdfbox.pdmodel.encryption.AccessPermission
+import com.tom_roush.pdfbox.pdmodel.encryption.InvalidPasswordException
 import com.tom_roush.pdfbox.pdmodel.encryption.StandardProtectionPolicy
 import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
+import com.tom_roush.pdfbox.pdmodel.graphics.image.JPEGFactory
 import com.tom_roush.pdfbox.pdmodel.graphics.image.LosslessFactory
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.util.Matrix
 import java.io.File
-import java.io.FileOutputStream
 
 object PdfEngine {
     @Volatile
     private var initialized = false
 
-    fun init(context: Context) {
-        if (!initialized) {
-            PDFBoxResourceLoader.init(context.applicationContext)
+    fun init(context: Context?) {
+        if (!initialized && context != null) {
+            runCatching {
+                PDFBoxResourceLoader.init(context.applicationContext)
+            }
             initialized = true
         }
     }
 
-    fun createBlankPdf(context: Context, outFile: File, title: String = "Office Pro PDF") {
+    fun validatePdfIntegrity(file: File, password: String? = null): Boolean {
+        if (!file.exists() || file.length() < 8L) return false
+        return runCatching {
+            PDDocument.load(file, password ?: "").use { it.numberOfPages > 0 }
+        }.getOrDefault(false)
+    }
+
+    fun isPasswordProtected(context: Context?, file: File): Boolean {
         init(context)
-        PDDocument().use { doc ->
-            val page = PDPage(PDRectangle.A4)
-            doc.addPage(page)
-            PDPageContentStream(doc, page).use { cs ->
-                cs.beginText()
-                cs.setFont(PDType1Font.HELVETICA_BOLD, 16f)
-                cs.newLineAtOffset(50f, 770f)
-                cs.showText(title.filter { it.code in 32..126 }.ifEmpty { "Office Pro Document" })
-                cs.endText()
+        return try {
+            PDDocument.load(file, "").use { false }
+        } catch (_: InvalidPasswordException) {
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    fun createBlankPdf(context: Context?, outFile: File, title: String = "Office Pro PDF") {
+        init(context)
+        SafeSaveManager.saveAtomically(outFile, context) { tempOut ->
+            PDDocument().use { doc ->
+                val page = PDPage(PDRectangle.A4)
+                doc.addPage(page)
+                val font = ArabicPdfTextHelper.loadUnicodeFont(context, doc)
+                val prepared = ArabicPdfTextHelper.prepareForPdfShowText(title, font)
+                PDPageContentStream(doc, page).use { cs ->
+                    cs.beginText()
+                    cs.setFont(font, 16f)
+                    cs.newLineAtOffset(50f, 770f)
+                    cs.showText(prepared)
+                    cs.endText()
+                }
+                doc.save(tempOut)
             }
-            doc.save(outFile)
         }
     }
 
     fun getPageCount(file: File, password: String? = null): Int {
-        return try {
-            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
-                PdfRenderer(pfd).use { renderer -> renderer.pageCount }
-            }
-        } catch (e: Exception) {
-            try {
-                PDDocument.load(file, password ?: "").use { it.numberOfPages }
-            } catch (_: Exception) {
-                0
-            }
-        }
-    }
-
-    fun renderPageBitmap(file: File, pageIndex: Int, scale: Float = 1.5f): Bitmap? {
-        return try {
-            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
-                PdfRenderer(pfd).use { renderer ->
-                    if (pageIndex < 0 || pageIndex >= renderer.pageCount) return null
-                    renderer.openPage(pageIndex).use { page ->
-                        val w = (page.width * scale).toInt().coerceIn(100, 2400)
-                        val h = (page.height * scale).toInt().coerceIn(100, 3400)
-                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                        bmp.eraseColor(Color.WHITE)
-                        page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        bmp
-                    }
+        if (!file.exists() || file.length() == 0L) return 0
+        if (password.isNullOrEmpty()) {
+            val nativeCount = runCatching {
+                ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
+                    PdfRenderer(pfd).use { renderer -> renderer.pageCount }
                 }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
+            }.getOrNull()
+            if (nativeCount != null && nativeCount > 0) return nativeCount
         }
+        return runCatching {
+            PDDocument.load(file, password ?: "").use { it.numberOfPages }
+        }.getOrDefault(0)
     }
 
-    fun extractAllText(context: Context, file: File, password: String? = null): String {
+    suspend fun renderPageBitmap(
+        context: Context,
+        file: File,
+        pageIndex: Int,
+        scale: Float = 1.5f,
+        password: String? = null
+    ): Bitmap? {
+        return PdfRenderCache.renderPage(context, file, pageIndex, scale, password)
+    }
+
+    fun extractAllText(context: Context?, file: File, password: String? = null): String {
         init(context)
         return PDDocument.load(file, password ?: "").use { doc ->
             PDFTextStripper().getText(doc)
         }
     }
 
-    fun searchTextPages(context: Context, file: File, query: String): List<Int> {
+    fun extractPageText(context: Context?, file: File, pageIndex: Int, password: String? = null): String {
+        init(context)
+        return runCatching {
+            PDDocument.load(file, password ?: "").use { doc ->
+                if (pageIndex !in 0 until doc.numberOfPages) return ""
+                val stripper = PDFTextStripper()
+                stripper.startPage = pageIndex + 1
+                stripper.endPage = pageIndex + 1
+                stripper.getText(doc)
+            }
+        }.getOrDefault("")
+    }
+
+    fun searchTextPages(context: Context?, file: File, query: String, password: String? = null): List<Int> {
         init(context)
         if (query.isBlank()) return emptyList()
         val matches = mutableListOf<Int>()
-        PDDocument.load(file).use { doc ->
-            val stripper = PDFTextStripper()
-            for (p in 1..doc.numberOfPages) {
-                stripper.startPage = p
-                stripper.endPage = p
-                val text = stripper.getText(doc)
-                if (text.contains(query, ignoreCase = true)) {
-                    matches.add(p - 1)
+        runCatching {
+            PDDocument.load(file, password ?: "").use { doc ->
+                val stripper = PDFTextStripper()
+                for (p in 1..doc.numberOfPages) {
+                    stripper.startPage = p
+                    stripper.endPage = p
+                    val text = stripper.getText(doc)
+                    if (text.contains(query, ignoreCase = true)) {
+                        matches.add(p - 1)
+                    }
                 }
             }
         }
@@ -108,36 +140,46 @@ object PdfEngine {
     }
 
     fun addTextAnnotation(
-        context: Context,
+        context: Context?,
         file: File,
         pageIndex: Int,
         text: String,
         xFraction: Float,
         yFraction: Float,
         fontSize: Float = 14f,
-        colorInt: Int = Color.BLUE
-    ) {
+        colorInt: Int = Color.BLUE,
+        password: String? = null
+    ): SafeSaveResult {
         init(context)
-        PDDocument.load(file).use { doc ->
-            val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
-            val mediaBox = page.mediaBox
-            val x = mediaBox.lowerLeftX + xFraction * mediaBox.width
-            val y = mediaBox.lowerLeftY + (1f - yFraction) * mediaBox.height
-            PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
-                cs.beginText()
-                cs.setFont(PDType1Font.HELVETICA_BOLD, fontSize)
-                cs.setNonStrokingColor(Color.red(colorInt), Color.green(colorInt), Color.blue(colorInt))
-                cs.newLineAtOffset(x, y)
-                val safeText = text.filter { it.code in 32..126 }.ifEmpty { "Note" }
-                cs.showText(safeText)
-                cs.endText()
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { doc ->
+                val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
+                val mediaBox = page.mediaBox
+                val x = mediaBox.lowerLeftX + xFraction * mediaBox.width
+                val y = mediaBox.lowerLeftY + (1f - yFraction) * mediaBox.height
+                val font = ArabicPdfTextHelper.loadUnicodeFont(context, doc)
+                val prepared = ArabicPdfTextHelper.prepareForPdfShowText(text, font)
+                PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
+                    cs.beginText()
+                    cs.setFont(font, fontSize)
+                    cs.setNonStrokingColor(Color.red(colorInt), Color.green(colorInt), Color.blue(colorInt))
+                    cs.newLineAtOffset(x, y)
+                    cs.showText(prepared)
+                    cs.endText()
+                }
+                doc.save(tempOut)
             }
-            doc.save(file)
         }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
     }
 
     fun addHighlightOrShape(
-        context: Context,
+        context: Context?,
         file: File,
         pageIndex: Int,
         xFraction: Float,
@@ -145,228 +187,358 @@ object PdfEngine {
         wFraction: Float,
         hFraction: Float,
         colorInt: Int = Color.YELLOW,
-        isFilledHighlight: Boolean = true
-    ) {
+        isFilledHighlight: Boolean = true,
+        password: String? = null
+    ): SafeSaveResult {
         init(context)
-        PDDocument.load(file).use { doc ->
-            val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
-            val box = page.mediaBox
-            val x = box.lowerLeftX + xFraction * box.width
-            val w = wFraction * box.width
-            val h = hFraction * box.height
-            val y = box.lowerLeftY + (1f - yFraction) * box.height - h
-            PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
-                if (isFilledHighlight) {
-                    cs.setNonStrokingColor(Color.red(colorInt), Color.green(colorInt), Color.blue(colorInt))
-                    cs.addRect(x, y, w, h)
-                    cs.fill()
-                } else {
-                    cs.setStrokingColor(Color.red(colorInt), Color.green(colorInt), Color.blue(colorInt))
-                    cs.setLineWidth(2f)
-                    cs.addRect(x, y, w, h)
-                    cs.stroke()
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { doc ->
+                val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
+                val box = page.mediaBox
+                val x = box.lowerLeftX + xFraction * box.width
+                val w = wFraction * box.width
+                val h = hFraction * box.height
+                val y = box.lowerLeftY + (1f - yFraction) * box.height - h
+                PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
+                    if (isFilledHighlight) {
+                        cs.setNonStrokingColor(Color.red(colorInt), Color.green(colorInt), Color.blue(colorInt))
+                        cs.addRect(x, y, w, h)
+                        cs.fill()
+                    } else {
+                        cs.setStrokingColor(Color.red(colorInt), Color.green(colorInt), Color.blue(colorInt))
+                        cs.setLineWidth(2f)
+                        cs.addRect(x, y, w, h)
+                        cs.stroke()
+                    }
                 }
+                doc.save(tempOut)
             }
-            doc.save(file)
         }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
     }
 
     fun addBitmapOverlay(
-        context: Context,
+        context: Context?,
         file: File,
         pageIndex: Int,
         bitmap: Bitmap,
         xFraction: Float = 0.25f,
         yFraction: Float = 0.65f,
-        widthFraction: Float = 0.4f
-    ) {
+        widthFraction: Float = 0.4f,
+        password: String? = null
+    ): SafeSaveResult {
         init(context)
-        PDDocument.load(file).use { doc ->
-            val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
-            val box = page.mediaBox
-            val w = widthFraction * box.width
-            val aspect = bitmap.height.toFloat() / bitmap.width.coerceAtLeast(1)
-            val h = w * aspect
-            val x = box.lowerLeftX + xFraction * box.width
-            val y = box.lowerLeftY + (1f - yFraction) * box.height - h
-            val pdImage = LosslessFactory.createFromImage(doc, bitmap)
-            PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
-                cs.drawImage(pdImage, x, y, w, h)
-            }
-            doc.save(file)
-        }
-    }
-
-    fun addBlankPage(context: Context, file: File) {
-        init(context)
-        PDDocument.load(file).use { doc ->
-            doc.addPage(PDPage(PDRectangle.A4))
-            doc.save(file)
-        }
-    }
-
-    fun deletePage(context: Context, file: File, pageIndex: Int) {
-        init(context)
-        PDDocument.load(file).use { doc ->
-            if (doc.numberOfPages > 1 && pageIndex in 0 until doc.numberOfPages) {
-                doc.removePage(pageIndex)
-                doc.save(file)
-            }
-        }
-    }
-
-    fun rotatePage(context: Context, file: File, pageIndex: Int, degrees: Int = 90) {
-        init(context)
-        PDDocument.load(file).use { doc ->
-            val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
-            page.rotation = (page.rotation + degrees) % 360
-            doc.save(file)
-        }
-    }
-
-    fun cropPage(context: Context, file: File, pageIndex: Int, marginInsetPt: Float = 36f) {
-        init(context)
-        PDDocument.load(file).use { doc ->
-            val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
-            val box = page.cropBox
-            val newBox = PDRectangle(
-                box.lowerLeftX + marginInsetPt,
-                box.lowerLeftY + marginInsetPt,
-                (box.width - marginInsetPt * 2).coerceAtLeast(100f),
-                (box.height - marginInsetPt * 2).coerceAtLeast(100f)
-            )
-            page.cropBox = newBox
-            doc.save(file)
-        }
-    }
-
-    fun reorderPages(context: Context, file: File, newOrder: List<Int>) {
-        init(context)
-        PDDocument.load(file).use { src ->
-            PDDocument().use { dest ->
-                newOrder.forEach { idx ->
-                    if (idx in 0 until src.numberOfPages) {
-                        dest.importPage(src.getPage(idx))
-                    }
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { doc ->
+                val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
+                val box = page.mediaBox
+                val w = widthFraction * box.width
+                val aspect = bitmap.height.toFloat() / bitmap.width.coerceAtLeast(1)
+                val h = w * aspect
+                val x = box.lowerLeftX + xFraction * box.width
+                val y = box.lowerLeftY + (1f - yFraction) * box.height - h
+                val pdImage = LosslessFactory.createFromImage(doc, bitmap)
+                PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
+                    cs.drawImage(pdImage, x, y, w, h)
                 }
-                dest.save(file)
+                doc.save(tempOut)
             }
         }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
     }
 
-    fun extractPages(context: Context, srcFile: File, pageIndices: List<Int>, outFile: File) {
+    fun addBlankPage(context: Context?, file: File, password: String? = null): SafeSaveResult {
         init(context)
-        PDDocument.load(srcFile).use { src ->
-            PDDocument().use { dest ->
-                pageIndices.forEach { idx ->
-                    if (idx in 0 until src.numberOfPages) {
-                        dest.importPage(src.getPage(idx))
-                    }
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { doc ->
+                doc.addPage(PDPage(PDRectangle.A4))
+                doc.save(tempOut)
+            }
+        }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
+    }
+
+    fun deletePage(context: Context?, file: File, pageIndex: Int, password: String? = null): SafeSaveResult {
+        init(context)
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { doc ->
+                if (doc.numberOfPages > 1 && pageIndex in 0 until doc.numberOfPages) {
+                    doc.removePage(pageIndex)
                 }
-                dest.save(outFile)
+                doc.save(tempOut)
+            }
+        }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
+    }
+
+    fun rotatePage(context: Context?, file: File, pageIndex: Int, degrees: Int = 90, password: String? = null): SafeSaveResult {
+        init(context)
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { doc ->
+                val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
+                page.rotation = (page.rotation + degrees) % 360
+                doc.save(tempOut)
+            }
+        }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
+    }
+
+    fun cropPage(context: Context?, file: File, pageIndex: Int, marginInsetPt: Float = 36f, password: String? = null): SafeSaveResult {
+        init(context)
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { doc ->
+                val page = doc.getPage(pageIndex.coerceIn(0, doc.numberOfPages - 1))
+                val box = page.cropBox
+                val newBox = PDRectangle(
+                    box.lowerLeftX + marginInsetPt,
+                    box.lowerLeftY + marginInsetPt,
+                    (box.width - marginInsetPt * 2).coerceAtLeast(100f),
+                    (box.height - marginInsetPt * 2).coerceAtLeast(100f)
+                )
+                page.cropBox = newBox
+                doc.save(tempOut)
+            }
+        }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
+    }
+
+    fun reorderPages(context: Context?, file: File, newOrder: List<Int>, password: String? = null): SafeSaveResult {
+        init(context)
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { src ->
+                PDDocument().use { dest ->
+                    newOrder.forEach { idx ->
+                        if (idx in 0 until src.numberOfPages) {
+                            dest.importPage(src.getPage(idx))
+                        }
+                    }
+                    dest.save(tempOut)
+                }
+            }
+        }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
+    }
+
+    fun extractPages(context: Context?, srcFile: File, pageIndices: List<Int>, outFile: File, password: String? = null) {
+        init(context)
+        SafeSaveManager.saveAtomically(outFile, context) { tempOut ->
+            PDDocument.load(srcFile, password ?: "").use { src ->
+                PDDocument().use { dest ->
+                    pageIndices.forEach { idx ->
+                        if (idx in 0 until src.numberOfPages) {
+                            dest.importPage(src.getPage(idx))
+                        }
+                    }
+                    dest.save(tempOut)
+                }
             }
         }
     }
 
-    fun mergePdfs(context: Context, files: List<File>, outFile: File) {
+    fun mergePdfs(context: Context?, files: List<File>, outFile: File) {
         init(context)
-        val merger = PDFMergerUtility()
-        merger.destinationFileName = outFile.absolutePath
-        files.forEach { merger.addSource(it) }
-        merger.mergeDocuments(null)
+        SafeSaveManager.saveAtomically(outFile, context) { tempOut ->
+            val merger = PDFMergerUtility()
+            merger.destinationFileName = tempOut.absolutePath
+            files.forEach { merger.addSource(it) }
+            merger.mergeDocuments(null)
+        }
     }
 
-    fun splitPdf(context: Context, srcFile: File, splitAfterPage: Int, outPart1: File, outPart2: File) {
+    fun splitPdf(context: Context?, srcFile: File, splitAfterPage: Int, outPart1: File, outPart2: File, password: String? = null) {
         init(context)
-        PDDocument.load(srcFile).use { src ->
+        PDDocument.load(srcFile, password ?: "").use { src ->
             val total = src.numberOfPages
             val cut = splitAfterPage.coerceIn(1, (total - 1).coerceAtLeast(1))
-            PDDocument().use { p1 ->
-                for (i in 0 until cut) p1.importPage(src.getPage(i))
-                p1.save(outPart1)
-            }
-            PDDocument().use { p2 ->
-                for (i in cut until total) p2.importPage(src.getPage(i))
-                p2.save(outPart2)
-            }
-        }
-    }
-
-    fun addPageNumbers(context: Context, file: File) {
-        init(context)
-        PDDocument.load(file).use { doc ->
-            val total = doc.numberOfPages
-            for (i in 0 until total) {
-                val page = doc.getPage(i)
-                val box = page.mediaBox
-                PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
-                    cs.beginText()
-                    cs.setFont(PDType1Font.HELVETICA, 10f)
-                    cs.setNonStrokingColor(100, 116, 139)
-                    cs.newLineAtOffset(box.width / 2f - 15f, 24f)
-                    cs.showText("${i + 1} / $total")
-                    cs.endText()
+            SafeSaveManager.saveAtomically(outPart1, context) { temp1 ->
+                PDDocument().use { p1 ->
+                    for (i in 0 until cut) p1.importPage(src.getPage(i))
+                    p1.save(temp1)
                 }
             }
-            doc.save(file)
-        }
-    }
-
-    fun addWatermark(context: Context, file: File, watermarkText: String) {
-        init(context)
-        val safeText = watermarkText.filter { it.code in 32..126 }.ifEmpty { "CONFIDENTIAL" }
-        PDDocument.load(file).use { doc ->
-            for (i in 0 until doc.numberOfPages) {
-                val page = doc.getPage(i)
-                val box = page.mediaBox
-                PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
-                    cs.beginText()
-                    cs.setFont(PDType1Font.HELVETICA_BOLD, 42f)
-                    cs.setNonStrokingColor(203, 213, 225)
-                    cs.setTextMatrix(Matrix.getRotateInstance(Math.toRadians(45.0), box.width * 0.25f, box.height * 0.35f))
-                    cs.showText(safeText)
-                    cs.endText()
+            SafeSaveManager.saveAtomically(outPart2, context) { temp2 ->
+                PDDocument().use { p2 ->
+                    for (i in cut until total) p2.importPage(src.getPage(i))
+                    p2.save(temp2)
                 }
             }
-            doc.save(file)
         }
     }
 
-    fun protectWithPassword(context: Context, file: File, password: String) {
+    fun addPageNumbers(context: Context?, file: File, password: String? = null): SafeSaveResult {
         init(context)
-        PDDocument.load(file).use { doc ->
-            val ap = AccessPermission()
-            val spp = StandardProtectionPolicy(password, password, ap)
-            spp.encryptionKeyLength = 128
-            doc.protect(spp)
-            doc.save(file)
-        }
-    }
-
-    fun removePassword(context: Context, file: File, currentPassword: String) {
-        init(context)
-        PDDocument.load(file, currentPassword).use { doc ->
-            doc.isAllSecurityToBeRemoved = true
-            doc.save(file)
-        }
-    }
-
-    fun compressPdf(context: Context, srcFile: File, outFile: File) {
-        // Re-render pages at optimized 150 DPI JPEG/PNG into a clean compressed PDF
-        init(context)
-        val count = getPageCount(srcFile)
-        PDDocument().use { dest ->
-            for (i in 0 until count) {
-                val bmp = renderPageBitmap(srcFile, i, 1.2f) ?: continue
-                val page = PDPage(PDRectangle(bmp.width.toFloat(), bmp.height.toFloat()))
-                dest.addPage(page)
-                val pdImg = LosslessFactory.createFromImage(dest, bmp)
-                PDPageContentStream(dest, page).use { cs ->
-                    cs.drawImage(pdImg, 0f, 0f, bmp.width.toFloat(), bmp.height.toFloat())
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { doc ->
+                val total = doc.numberOfPages
+                for (i in 0 until total) {
+                    val page = doc.getPage(i)
+                    val box = page.mediaBox
+                    PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
+                        cs.beginText()
+                        cs.setFont(PDType1Font.HELVETICA, 10f)
+                        cs.setNonStrokingColor(100, 116, 139)
+                        cs.newLineAtOffset(box.width / 2f - 15f, 24f)
+                        cs.showText("${i + 1} / $total")
+                        cs.endText()
+                    }
                 }
-                bmp.recycle()
+                doc.save(tempOut)
             }
-            dest.save(outFile)
+        }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
+    }
+
+    fun addWatermark(context: Context?, file: File, watermarkText: String, password: String? = null): SafeSaveResult {
+        init(context)
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file, password ?: "").use { doc ->
+                val font = ArabicPdfTextHelper.loadUnicodeFont(context, doc)
+                val prepared = ArabicPdfTextHelper.prepareForPdfShowText(watermarkText, font)
+                for (i in 0 until doc.numberOfPages) {
+                    val page = doc.getPage(i)
+                    val box = page.mediaBox
+                    PDPageContentStream(doc, page, PDPageContentStream.AppendMode.APPEND, true, true).use { cs ->
+                        cs.beginText()
+                        cs.setFont(font, 38f)
+                        cs.setNonStrokingColor(203, 213, 225)
+                        cs.setTextMatrix(Matrix.getRotateInstance(Math.toRadians(45.0), box.width * 0.25f, box.height * 0.35f))
+                        cs.showText(prepared)
+                        cs.endText()
+                    }
+                }
+                doc.save(tempOut)
+            }
+        }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
+    }
+
+    fun protectWithPassword(context: Context?, file: File, password: String): SafeSaveResult {
+        init(context)
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, password) }
+        ) { tempOut ->
+            PDDocument.load(file).use { doc ->
+                val ap = AccessPermission()
+                val spp = StandardProtectionPolicy(password, password, ap)
+                spp.encryptionKeyLength = 128
+                doc.protect(spp)
+                doc.save(tempOut)
+            }
+        }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
+    }
+
+    fun removePassword(context: Context?, file: File, currentPassword: String): SafeSaveResult {
+        init(context)
+        val res = SafeSaveManager.saveAtomically(
+            targetFile = file,
+            context = context,
+            validator = { validatePdfIntegrity(it, null) }
+        ) { tempOut ->
+            PDDocument.load(file, currentPassword).use { doc ->
+                doc.isAllSecurityToBeRemoved = true
+                doc.save(tempOut)
+            }
+        }
+        if (res is SafeSaveResult.Success) PdfRenderCache.invalidateFile(file.absolutePath)
+        return res
+    }
+
+    /**
+     * Compresses a PDF file:
+     * - Default (imageBased = false): Lossless structural compression (re-compresses streams &
+     *   strips redundant document info/thumbnails while preserving 100% of selectable text & vectors).
+     * - Optional (imageBased = true): Re-renders pages as optimized JPEG for scanned documents.
+     */
+    suspend fun compressPdf(
+        context: Context,
+        srcFile: File,
+        outFile: File,
+        imageBased: Boolean = false,
+        password: String? = null
+    ): SafeSaveResult {
+        init(context)
+        return if (!imageBased) {
+            SafeSaveManager.saveAtomically(
+                targetFile = outFile,
+                context = context,
+                validator = { validatePdfIntegrity(it, password) }
+            ) { tempOut ->
+                PDDocument.load(srcFile, password ?: "").use { doc ->
+                    doc.documentCatalog.metadata = null
+                    doc.save(tempOut)
+                }
+            }
+        } else {
+            val count = getPageCount(srcFile, password)
+            val bitmaps = (0 until count).mapNotNull { i ->
+                PdfRenderCache.renderPage(context, srcFile, i, 1.25f, password)
+            }
+            SafeSaveManager.saveAtomically(
+                targetFile = outFile,
+                context = context,
+                validator = { validatePdfIntegrity(it, null) }
+            ) { tempOut ->
+                PDDocument().use { dest ->
+                    bitmaps.forEach { bmp ->
+                        val page = PDPage(PDRectangle(bmp.width.toFloat(), bmp.height.toFloat()))
+                        dest.addPage(page)
+                        val pdImg = JPEGFactory.createFromImage(dest, bmp, 0.75f)
+                        PDPageContentStream(dest, page).use { cs ->
+                            cs.drawImage(pdImg, 0f, 0f, bmp.width.toFloat(), bmp.height.toFloat())
+                        }
+                    }
+                    dest.save(tempOut)
+                }
+            }
         }
     }
 }

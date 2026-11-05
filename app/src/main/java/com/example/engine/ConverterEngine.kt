@@ -8,13 +8,13 @@ import java.io.File
 import java.io.FileOutputStream
 
 enum class ConversionType(val titleAr: String, val titleEn: String, val sourceExts: List<String>, val targetExt: String) {
-    WORD_TO_PDF("Word إلى PDF", "Word to PDF", listOf("docx", "rtf", "doc"), "pdf"),
+    WORD_TO_PDF("Word إلى PDF", "Word to PDF", listOf("docx", "dotx", "rtf", "doc", "dot", "odt"), "pdf"),
     PDF_TO_WORD("PDF إلى Word", "PDF to Word", listOf("pdf"), "docx"),
-    EXCEL_TO_PDF("Excel إلى PDF", "Excel to PDF", listOf("xlsx", "csv", "xls"), "pdf"),
+    EXCEL_TO_PDF("Excel إلى PDF", "Excel to PDF", listOf("xlsx", "xlsm", "xlsb", "csv", "xls", "ods"), "pdf"),
     PDF_TO_EXCEL("PDF إلى Excel", "PDF to Excel", listOf("pdf"), "xlsx"),
-    PPT_TO_PDF("PowerPoint إلى PDF", "PowerPoint to PDF", listOf("pptx", "ppt"), "pdf"),
+    PPT_TO_PDF("PowerPoint إلى PDF", "PowerPoint to PDF", listOf("pptx", "ppsx", "potx", "ppt", "pps", "pot", "odp"), "pdf"),
     PDF_TO_PPT("PDF إلى PowerPoint", "PDF to PowerPoint", listOf("pdf"), "pptx"),
-    IMAGES_TO_PDF("صور إلى PDF واحد", "Images to Single PDF", listOf("jpg", "jpeg", "png", "webp"), "pdf"),
+    IMAGES_TO_PDF("صور إلى PDF واحد", "Images to Single PDF", listOf("jpg", "jpeg", "png", "webp", "bmp"), "pdf"),
     PDF_TO_IMAGES("PDF إلى صور", "PDF to Images", listOf("pdf"), "png"),
     TXT_TO_PDF("TXT إلى PDF", "TXT to PDF", listOf("txt"), "pdf"),
     LEGACY_TO_MODERN("ترقية الصيغ القديمة (DOC/XLS/PPT)", "Upgrade Legacy Formats", listOf("doc", "xls", "ppt"), "modern")
@@ -22,7 +22,7 @@ enum class ConversionType(val titleAr: String, val titleEn: String, val sourceEx
 
 object ConverterEngine {
 
-    fun convertSingleFile(context: Context, srcFile: File, type: ConversionType, outDir: File): Result<List<File>> {
+    suspend fun convertSingleFile(context: Context, srcFile: File, type: ConversionType, outDir: File): Result<List<File>> {
         return runCatching {
             val baseName = srcFile.nameWithoutExtension
             when (type) {
@@ -135,10 +135,9 @@ object ConverterEngine {
                     if (count <= 0) throw IllegalStateException("تعذر قراءة صفحات PDF.")
                     val outFiles = mutableListOf<File>()
                     for (i in 0 until count) {
-                        val bmp = PdfEngine.renderPageBitmap(srcFile, i, 2.0f) ?: continue
+                        val bmp = PdfEngine.renderPageBitmap(context, srcFile, i, 2.0f) ?: continue
                         val imgFile = File(outDir, "${baseName}_page_${i + 1}.png")
                         FileOutputStream(imgFile).use { bmp.compress(Bitmap.CompressFormat.PNG, 95, it) }
-                        bmp.recycle()
                         outFiles.add(imgFile)
                     }
                     outFiles

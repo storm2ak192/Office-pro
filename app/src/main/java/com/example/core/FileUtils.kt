@@ -35,31 +35,33 @@ object FileUtils {
         val ext = extension.lowercase(Locale.ROOT).removePrefix(".")
         return when (ext) {
             "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            "doc" -> "application/msword"
+            "dotx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
+            "doc", "dot" -> "application/msword"
             "rtf" -> "application/rtf"
             "txt" -> "text/plain"
+            "odt" -> "application/vnd.oasis.opendocument.text"
             "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "xlsm" -> "application/vnd.ms-excel.sheet.macroEnabled.12"
+            "xlsb" -> "application/vnd.ms-excel.sheet.binary.macroEnabled.12"
             "xls" -> "application/vnd.ms-excel"
             "csv" -> "text/csv"
+            "ods" -> "application/vnd.oasis.opendocument.spreadsheet"
             "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            "ppt" -> "application/vnd.ms-powerpoint"
+            "ppsx" -> "application/vnd.openxmlformats-officedocument.presentationml.slideshow"
+            "potx" -> "application/vnd.openxmlformats-officedocument.presentationml.template"
+            "ppt", "pps", "pot" -> "application/vnd.ms-powerpoint"
+            "odp" -> "application/vnd.oasis.opendocument.presentation"
             "pdf" -> "application/pdf"
             "png" -> "image/png"
             "jpg", "jpeg" -> "image/jpeg"
             "webp" -> "image/webp"
+            "bmp" -> "image/bmp"
             else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
         }
     }
 
     fun detectFileType(extension: String): OfficeFileType {
-        return when (extension.lowercase(Locale.ROOT).removePrefix(".")) {
-            "doc", "docx", "rtf", "txt" -> OfficeFileType.WORD
-            "xls", "xlsx", "csv" -> OfficeFileType.EXCEL
-            "ppt", "pptx" -> OfficeFileType.POWERPOINT
-            "pdf" -> OfficeFileType.PDF
-            "png", "jpg", "jpeg", "webp", "bmp" -> OfficeFileType.IMAGE
-            else -> OfficeFileType.WORD
-        }
+        return DocumentDetector.fromExtension(extension).officeType
     }
 
     fun queryDisplayName(context: Context, uri: Uri): String {

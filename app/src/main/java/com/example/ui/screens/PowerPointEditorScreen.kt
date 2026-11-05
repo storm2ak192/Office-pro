@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -31,8 +32,11 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.core.DocumentMode
 import com.example.core.FileUtils
 import com.example.core.LocalAppStrings
+import com.example.core.SafeSaveResult
+import com.example.core.SaveState
 import com.example.data.OfficeRepository
 import com.example.engine.*
 import com.example.ui.theme.ExcelBadgeColor
@@ -55,11 +59,23 @@ fun PowerPointEditorScreen(
     val scope = rememberCoroutineScope()
     val file = remember(filePath) { File(filePath) }
 
+    var mode by remember { mutableStateOf(DocumentMode.VIEW) }
     var presentation by remember { mutableStateOf(PresentationModel()) }
     var selectedElementId by remember { mutableStateOf<String?>(null) }
     var isPresentationMode by remember { mutableStateOf(false) }
     var isUnsaved by remember { mutableStateOf(false) }
+    var saveState by remember { mutableStateOf<SaveState>(SaveState.Saved) }
+    var showExitConfirmDialog by remember { mutableStateOf(false) }
+    var showSaveAsDialog by remember { mutableStateOf(false) }
     var statusToast by remember { mutableStateOf<String?>(null) }
+
+    BackHandler(enabled = !isPresentationMode && (isUnsaved || mode == DocumentMode.EDIT)) {
+        if (isUnsaved) {
+            showExitConfirmDialog = true
+        } else if (mode == DocumentMode.EDIT) {
+            mode = DocumentMode.VIEW
+        }
+    }
 
     LaunchedEffect(filePath) {
         val loaded = withContext(Dispatchers.IO) {
@@ -78,6 +94,7 @@ fun PowerPointEditorScreen(
         }
         presentation = presentation.copy(slides = updated)
         isUnsaved = true
+        saveState = SaveState.Unsaved
     }
 
     fun updateSelectedElement(transform: (SlideElement) -> SlideElement) {
@@ -87,14 +104,28 @@ fun PowerPointEditorScreen(
         }
     }
 
-    fun saveNow() {
+    fun saveNow(onSaved: (() -> Unit)? = null) {
         scope.launch {
-            withContext(Dispatchers.IO) {
-                PowerPointEngine.savePresentation(file, presentation)
-                repository.registerOrUpdateFile(file, markOpened = true)
+            saveState = SaveState.Saving
+            val res = withContext(Dispatchers.IO) {
+                val r = PowerPointEngine.savePresentation(file, presentation, context)
+                if (r is SafeSaveResult.Success) {
+                    repository.registerOrUpdateFile(file, markOpened = true)
+                }
+                r
             }
-            isUnsaved = false
-            statusToast = strings.saved
+            when (res) {
+                is SafeSaveResult.Success -> {
+                    isUnsaved = false
+                    saveState = SaveState.Saved
+                    statusToast = strings.saved
+                    onSaved?.invoke()
+                }
+                is SafeSaveResult.Failure -> {
+                    saveState = SaveState.Failed(res.message)
+                    statusToast = res.message
+                }
+            }
         }
     }
 
@@ -178,8 +209,7 @@ fun PowerPointEditorScreen(
             TopAppBar(
                 navigationIcon = {
                     IconButton(onClick = {
-                        if (isUnsaved) saveNow()
-                        onBack()
+                        if (isUnsaved) showExitConfirmDialog = true else onBack()
                     }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
@@ -187,24 +217,44 @@ fun PowerPointEditorScreen(
                 title = {
                     Column {
                         Text(file.name, style = MaterialTheme.typography.titleMedium, maxLines = 1)
+                        val modeLabel = if (mode == DocumentMode.VIEW) "وضع العرض" else "وضع التحرير"
+                        val stateLabel = when (saveState) {
+                            is SaveState.Saved -> strings.saved
+                            is SaveState.Unsaved -> strings.unsaved
+                            is SaveState.Saving -> strings.saving
+                            is SaveState.Failed -> "فشل الحفظ"
+                        }
                         Text(
-                            text = "شريحة ${presentation.activeSlideIndex + 1} من ${presentation.slides.size}",
-                            style = MaterialTheme.typography.labelSmall
+                            text = "$modeLabel • شريحة ${presentation.activeSlideIndex + 1}/${presentation.slides.size} • $stateLabel",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isUnsaved) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 actions = {
+                    if (mode == DocumentMode.VIEW) {
+                        FilledTonalButton(
+                            onClick = { mode = DocumentMode.EDIT },
+                            modifier = Modifier.testTag("ppt_edit_mode_btn"),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                        ) {
+                            Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("تحرير")
+                        }
+                    } else {
+                        IconButton(
+                            onClick = { saveNow() },
+                            modifier = Modifier.testTag("save_ppt_btn")
+                        ) {
+                            Icon(Icons.Default.Save, contentDescription = strings.save)
+                        }
+                    }
                     IconButton(
                         onClick = { isPresentationMode = true },
                         modifier = Modifier.testTag("ppt_play_btn")
                     ) {
                         Icon(Icons.Default.PlayArrow, contentDescription = "Present")
-                    }
-                    IconButton(
-                        onClick = { saveNow() },
-                        modifier = Modifier.testTag("save_ppt_btn")
-                    ) {
-                        Icon(Icons.Default.Save, contentDescription = strings.save)
                     }
                     var moreMenu by remember { mutableStateOf(false) }
                     Box {
@@ -212,6 +262,16 @@ fun PowerPointEditorScreen(
                             Icon(Icons.Default.MoreVert, contentDescription = "More")
                         }
                         DropdownMenu(expanded = moreMenu, onDismissRequest = { moreMenu = false }) {
+                            if (mode == DocumentMode.EDIT) {
+                                DropdownMenuItem(
+                                    text = { Text("معاينة (وضع العرض)") },
+                                    onClick = { moreMenu = false; mode = DocumentMode.VIEW }
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("حفظ باسم (نسخة جديدة)") },
+                                onClick = { moreMenu = false; showSaveAsDialog = true }
+                            )
                             DropdownMenuItem(
                                 text = { Text("نسخ الشريحة الحالية") },
                                 onClick = {
@@ -284,8 +344,11 @@ fun PowerPointEditorScreen(
             // Slide Canvas (16:9)
             SlideCanvasView(
                 slide = activeSlide,
-                selectedElementId = selectedElementId,
-                onSelectElement = { selectedElementId = it },
+                selectedElementId = if (mode == DocumentMode.EDIT) selectedElementId else null,
+                onSelectElement = {
+                    selectedElementId = it
+                    if (mode == DocumentMode.VIEW) mode = DocumentMode.EDIT
+                },
                 modifier = Modifier
                     .fillMaxWidth()
                     .aspectRatio(16f / 9f)
@@ -293,6 +356,21 @@ fun PowerPointEditorScreen(
                     .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(14.dp))
             )
 
+            if (mode == DocumentMode.VIEW) {
+                if (activeSlide.speakerNotes.isNotBlank()) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        tonalElevation = 1.dp,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text("ملاحظات المحاضر", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            Text(activeSlide.speakerNotes, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            } else {
             // Add Elements & Slide Background Controls
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -453,22 +531,90 @@ fun PowerPointEditorScreen(
                     }
                 }
                 item {
-                    FilledTonalIconButton(
-                        onClick = {
-                            val newSlide = SlideModel()
-                            presentation = presentation.copy(
-                                slides = presentation.slides + newSlide,
-                                activeSlideIndex = presentation.slides.size
-                            )
-                            isUnsaved = true
-                        },
-                        modifier = Modifier.size(48.dp)
-                    ) {
-                        Icon(Icons.Default.Add, contentDescription = "Add Slide")
+                    if (mode == DocumentMode.EDIT) {
+                        FilledTonalIconButton(
+                            onClick = {
+                                val newSlide = SlideModel()
+                                presentation = presentation.copy(
+                                    slides = presentation.slides + newSlide,
+                                    activeSlideIndex = presentation.slides.size
+                                )
+                                isUnsaved = true
+                                saveState = SaveState.Unsaved
+                            },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = "Add Slide")
+                        }
                     }
                 }
             }
+            }
         }
+    }
+
+    if (showExitConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showExitConfirmDialog = false },
+            title = { Text("تغييرات غير محفوظة") },
+            text = { Text("هل تريد حفظ التغييرات قبل الخروج من العرض التقديمي؟") },
+            confirmButton = {
+                Button(onClick = {
+                    showExitConfirmDialog = false
+                    saveNow { onBack() }
+                }) { Text("حفظ التغييرات") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            showExitConfirmDialog = false
+                            onBack()
+                        },
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) { Text("تجاهل التغييرات") }
+                    TextButton(onClick = { showExitConfirmDialog = false }) { Text(strings.cancel) }
+                }
+            }
+        )
+    }
+
+    if (showSaveAsDialog) {
+        val ext = if (file.extension.equals("odp", true)) "odp" else "pptx"
+        var newName by remember { mutableStateOf("${file.nameWithoutExtension}_copy.$ext") }
+        AlertDialog(
+            onDismissRequest = { showSaveAsDialog = false },
+            title = { Text("حفظ باسم") },
+            text = {
+                OutlinedTextField(
+                    value = newName,
+                    onValueChange = { newName = it },
+                    label = { Text("اسم الملف الجديد") },
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val targetName = if (newName.contains('.')) newName else "$newName.$ext"
+                    showSaveAsDialog = false
+                    scope.launch(Dispatchers.IO) {
+                        val dest = FileUtils.ensureUniqueFile(file.parentFile!!, targetName)
+                        val res = PowerPointEngine.savePresentation(dest, presentation, context)
+                        withContext(Dispatchers.Main) {
+                            if (res is SafeSaveResult.Success) {
+                                repository.registerOrUpdateFile(res.savedFile, markOpened = false)
+                                statusToast = "تم الحفظ باسم ${res.savedFile.name}"
+                            } else if (res is SafeSaveResult.Failure) {
+                                statusToast = res.message
+                            }
+                        }
+                    }
+                }) { Text(strings.save) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSaveAsDialog = false }) { Text(strings.cancel) }
+            }
+        )
     }
 }
 

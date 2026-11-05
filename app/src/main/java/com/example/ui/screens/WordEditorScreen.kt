@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.graphics.BitmapFactory
 import android.util.Base64
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -17,6 +18,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.FormatAlignLeft
@@ -44,13 +46,18 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.core.DocumentMode
 import com.example.core.FileUtils
 import com.example.core.LocalAppStrings
+import com.example.core.SafeSaveManager
+import com.example.core.SafeSaveResult
+import com.example.core.SaveState
 import com.example.data.OfficeRepository
 import com.example.data.db.OfficeFileType
 import com.example.engine.*
 import com.example.ui.theme.CairoFontFamily
 import com.example.ui.theme.RobotoMonoFontFamily
+import com.example.ui.theme.RoyalBluePrimary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -74,16 +81,28 @@ fun WordEditorScreen(
     val scope = rememberCoroutineScope()
     val file = remember(filePath) { File(filePath) }
 
+    var mode by remember { mutableStateOf(DocumentMode.VIEW) }
     var doc by remember { mutableStateOf(WordDocumentModel()) }
     var activeParagraphIndex by remember { mutableIntStateOf(0) }
     var undoStack by remember { mutableStateOf<List<WordDocumentModel>>(emptyList()) }
     var redoStack by remember { mutableStateOf<List<WordDocumentModel>>(emptyList()) }
     var isUnsaved by remember { mutableStateOf(false) }
+    var saveState by remember { mutableStateOf<SaveState>(SaveState.Saved) }
     var showFindReplace by remember { mutableStateOf(false) }
     var showPageSetup by remember { mutableStateOf(false) }
     var showLinkDialog by remember { mutableStateOf(false) }
+    var showExitConfirmDialog by remember { mutableStateOf(false) }
+    var showSaveAsDialog by remember { mutableStateOf(false) }
     var showDraftRecovery by remember { mutableStateOf<WordDocumentModel?>(null) }
     var statusToast by remember { mutableStateOf<String?>(null) }
+
+    BackHandler(enabled = isUnsaved || mode == DocumentMode.EDIT) {
+        if (isUnsaved) {
+            showExitConfirmDialog = true
+        } else if (mode == DocumentMode.EDIT) {
+            mode = DocumentMode.VIEW
+        }
+    }
 
     LaunchedEffect(filePath) {
         val loaded = withContext(Dispatchers.IO) {
@@ -115,17 +134,32 @@ fun WordEditorScreen(
         redoStack = emptyList()
         doc = newDoc
         isUnsaved = true
+        saveState = SaveState.Unsaved
     }
 
-    fun saveNow() {
+    fun saveNow(onSaved: (() -> Unit)? = null) {
         scope.launch {
-            withContext(Dispatchers.IO) {
-                WordEngine.saveDocument(file, doc)
-                repository.registerOrUpdateFile(file, markOpened = true)
-                repository.deleteAutoSaveDraft(filePath)
+            saveState = SaveState.Saving
+            val res = withContext(Dispatchers.IO) {
+                val r = WordEngine.saveDocument(file, doc, context)
+                if (r is SafeSaveResult.Success) {
+                    repository.registerOrUpdateFile(file, markOpened = true)
+                    repository.deleteAutoSaveDraft(filePath)
+                }
+                r
             }
-            isUnsaved = false
-            statusToast = strings.saved
+            when (res) {
+                is SafeSaveResult.Success -> {
+                    isUnsaved = false
+                    saveState = SaveState.Saved
+                    statusToast = strings.saved
+                    onSaved?.invoke()
+                }
+                is SafeSaveResult.Failure -> {
+                    saveState = SaveState.Failed(res.message)
+                    statusToast = res.message
+                }
+            }
         }
     }
 
@@ -178,8 +212,7 @@ fun WordEditorScreen(
             TopAppBar(
                 navigationIcon = {
                     IconButton(onClick = {
-                        if (isUnsaved) saveNow()
-                        onBack()
+                        if (isUnsaved) showExitConfirmDialog = true else onBack()
                     }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
@@ -191,45 +224,66 @@ fun WordEditorScreen(
                             style = MaterialTheme.typography.titleMedium,
                             maxLines = 1
                         )
+                        val modeLabel = if (mode == DocumentMode.VIEW) "وضع العرض" else "وضع التحرير"
+                        val stateLabel = when (saveState) {
+                            is SaveState.Saved -> strings.saved
+                            is SaveState.Unsaved -> strings.unsaved
+                            is SaveState.Saving -> strings.saving
+                            is SaveState.Failed -> "فشل الحفظ"
+                        }
                         Text(
-                            text = "${if (isUnsaved) strings.unsaved else strings.saved} • $wordCount كلمة ($charCount حرف)",
+                            text = "$modeLabel • $stateLabel • $wordCount كلمة",
                             style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                            color = if (isUnsaved) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 },
                 actions = {
-                    IconButton(
-                        enabled = undoStack.isNotEmpty(),
-                        onClick = {
-                            val prev = undoStack.last()
-                            undoStack = undoStack.dropLast(1)
-                            redoStack = redoStack + doc
-                            doc = prev
-                            isUnsaved = true
-                        },
-                        modifier = Modifier.testTag("undo_btn")
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = strings.undo)
-                    }
-                    IconButton(
-                        enabled = redoStack.isNotEmpty(),
-                        onClick = {
-                            val next = redoStack.last()
-                            redoStack = redoStack.dropLast(1)
-                            undoStack = undoStack + doc
-                            doc = next
-                            isUnsaved = true
-                        },
-                        modifier = Modifier.testTag("redo_btn")
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = strings.redo)
-                    }
-                    IconButton(
-                        onClick = { saveNow() },
-                        modifier = Modifier.testTag("save_word_btn")
-                    ) {
-                        Icon(Icons.Default.Save, contentDescription = strings.save)
+                    if (mode == DocumentMode.VIEW) {
+                        FilledTonalButton(
+                            onClick = { mode = DocumentMode.EDIT },
+                            modifier = Modifier.testTag("word_edit_mode_btn"),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                        ) {
+                            Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("تحرير")
+                        }
+                    } else {
+                        IconButton(
+                            enabled = undoStack.isNotEmpty(),
+                            onClick = {
+                                val prev = undoStack.last()
+                                undoStack = undoStack.dropLast(1)
+                                redoStack = redoStack + doc
+                                doc = prev
+                                isUnsaved = true
+                                saveState = SaveState.Unsaved
+                            },
+                            modifier = Modifier.testTag("undo_btn")
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = strings.undo)
+                        }
+                        IconButton(
+                            enabled = redoStack.isNotEmpty(),
+                            onClick = {
+                                val next = redoStack.last()
+                                redoStack = redoStack.dropLast(1)
+                                undoStack = undoStack + doc
+                                doc = next
+                                isUnsaved = true
+                                saveState = SaveState.Unsaved
+                            },
+                            modifier = Modifier.testTag("redo_btn")
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = strings.redo)
+                        }
+                        IconButton(
+                            onClick = { saveNow() },
+                            modifier = Modifier.testTag("save_word_btn")
+                        ) {
+                            Icon(Icons.Default.Save, contentDescription = strings.save)
+                        }
                     }
                     var moreMenu by remember { mutableStateOf(false) }
                     Box {
@@ -237,13 +291,23 @@ fun WordEditorScreen(
                             Icon(Icons.Default.MoreVert, contentDescription = "More")
                         }
                         DropdownMenu(expanded = moreMenu, onDismissRequest = { moreMenu = false }) {
+                            if (mode == DocumentMode.EDIT) {
+                                DropdownMenuItem(
+                                    text = { Text("معاينة (وضع العرض)") },
+                                    onClick = { moreMenu = false; mode = DocumentMode.VIEW }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(strings.findReplace) },
+                                    onClick = { moreMenu = false; showFindReplace = true }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("إعدادات الصفحة والهوامش") },
+                                    onClick = { moreMenu = false; showPageSetup = true }
+                                )
+                            }
                             DropdownMenuItem(
-                                text = { Text(strings.findReplace) },
-                                onClick = { moreMenu = false; showFindReplace = true }
-                            )
-                            DropdownMenuItem(
-                                text = { Text("إعدادات الصفحة والهوامش") },
-                                onClick = { moreMenu = false; showPageSetup = true }
+                                text = { Text("حفظ باسم (نسخة جديدة)") },
+                                onClick = { moreMenu = false; showSaveAsDialog = true }
                             )
                             DropdownMenuItem(
                                 text = { Text(strings.exportPdf) },
@@ -270,7 +334,6 @@ fun WordEditorScreen(
                                 text = { Text(strings.share) },
                                 onClick = {
                                     moreMenu = false
-                                    saveNow()
                                     FileUtils.shareFile(context, file)
                                 }
                             )
@@ -280,6 +343,7 @@ fun WordEditorScreen(
             )
         },
         bottomBar = {
+            if (mode == DocumentMode.EDIT) {
             Surface(tonalElevation = 3.dp) {
                 Row(
                     modifier = Modifier
@@ -426,8 +490,157 @@ fun WordEditorScreen(
                     }) { Icon(Icons.Default.ContentPaste, contentDescription = "Paste") }
                 }
             }
+            }
         }
     ) { padding ->
+        if (mode == DocumentMode.VIEW) {
+            SelectionContainer {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(padding)
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    item {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            tonalElevation = 2.dp,
+                            shadowElevation = 2.dp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(8.dp))
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(20.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (doc.headerText.isNotBlank()) {
+                                    Text(
+                                        text = doc.headerText,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        textAlign = TextAlign.Center
+                                    )
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                                }
+
+                                doc.paragraphs.forEachIndexed { idx, p ->
+                                    if (p.imageBase64 != null) {
+                                        val bmp = remember(p.imageBase64) {
+                                            runCatching {
+                                                val bytes = Base64.decode(p.imageBase64, Base64.DEFAULT)
+                                                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                            }.getOrNull()
+                                        }
+                                        if (bmp != null) {
+                                            Image(
+                                                bitmap = bmp.asImageBitmap(),
+                                                contentDescription = "Document image",
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .heightIn(max = 240.dp)
+                                                    .clip(RoundedCornerShape(6.dp))
+                                            )
+                                        }
+                                    }
+                                    val prefix = when (p.listType) {
+                                        WordListType.BULLET -> "• "
+                                        WordListType.NUMBERED -> "${idx + 1}. "
+                                        WordListType.NONE -> ""
+                                    }
+                                    val computedSize = when (p.style) {
+                                        WordStyle.HEADING_1 -> (p.fontSizeSp + 8).sp
+                                        WordStyle.HEADING_2 -> (p.fontSizeSp + 5).sp
+                                        WordStyle.HEADING_3 -> (p.fontSizeSp + 2).sp
+                                        else -> p.fontSizeSp.sp
+                                    }
+                                    val textAlign = when (p.alignment) {
+                                        WordAlignment.RIGHT -> TextAlign.Right
+                                        WordAlignment.CENTER -> TextAlign.Center
+                                        WordAlignment.LEFT -> TextAlign.Left
+                                        WordAlignment.JUSTIFY -> TextAlign.Justify
+                                    }
+                                    val decoration = when {
+                                        p.isUnderline && p.isStrikethrough -> TextDecoration.Underline + TextDecoration.LineThrough
+                                        p.isUnderline -> TextDecoration.Underline
+                                        p.isStrikethrough -> TextDecoration.LineThrough
+                                        else -> TextDecoration.None
+                                    }
+                                    if (p.text.isNotEmpty() || prefix.isNotEmpty()) {
+                                        Text(
+                                            text = prefix + p.text,
+                                            style = TextStyle(
+                                                fontFamily = if (p.fontFamily == "RobotoMono") RobotoMonoFontFamily else CairoFontFamily,
+                                                fontSize = computedSize,
+                                                fontWeight = if (p.isBold || p.style != WordStyle.NORMAL) FontWeight.Bold else FontWeight.Normal,
+                                                fontStyle = if (p.isItalic || p.style == WordStyle.QUOTE) FontStyle.Italic else FontStyle.Normal,
+                                                textDecoration = decoration,
+                                                textAlign = textAlign,
+                                                color = runCatching { Color(android.graphics.Color.parseColor(p.textColorHex)) }
+                                                    .getOrDefault(MaterialTheme.colorScheme.onSurface)
+                                            ),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable {
+                                                    activeParagraphIndex = idx
+                                                    mode = DocumentMode.EDIT
+                                                }
+                                        )
+                                    }
+
+                                    doc.tables.filter { it.afterParagraphIndex == idx }.forEach { tbl ->
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(vertical = 6.dp)
+                                                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(6.dp))
+                                        ) {
+                                            tbl.rows.forEach { row ->
+                                                Row(modifier = Modifier.fillMaxWidth()) {
+                                                    row.forEach { cell ->
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .weight(cell.colSpan.toFloat().coerceAtLeast(1f))
+                                                                .background(
+                                                                    if (cell.isHeader) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
+                                                                    else Color.Transparent
+                                                                )
+                                                                .border(0.5.dp, MaterialTheme.colorScheme.outlineVariant)
+                                                                .padding(8.dp)
+                                                        ) {
+                                                            Text(
+                                                                text = cell.text,
+                                                                fontWeight = if (cell.isHeader) FontWeight.Bold else FontWeight.Normal,
+                                                                style = MaterialTheme.typography.bodySmall
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (doc.footerText.isNotBlank()) {
+                                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                                    Text(
+                                        text = doc.footerText,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -603,6 +816,7 @@ fun WordEditorScreen(
                 }
             }
         }
+        }
     }
 
     // Find & Replace Dialog
@@ -749,6 +963,71 @@ fun WordEditorScreen(
                     scope.launch { repository.deleteAutoSaveDraft(filePath) }
                     showDraftRecovery = null
                 }) { Text(strings.discard) }
+            }
+        )
+    }
+
+    if (showExitConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showExitConfirmDialog = false },
+            title = { Text("تغييرات غير محفوظة") },
+            text = { Text("هل تريد حفظ التغييرات قبل الخروج من المستند؟") },
+            confirmButton = {
+                Button(onClick = {
+                    showExitConfirmDialog = false
+                    saveNow { onBack() }
+                }) { Text("حفظ التغييرات") }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(
+                        onClick = {
+                            showExitConfirmDialog = false
+                            scope.launch { repository.deleteAutoSaveDraft(filePath) }
+                            onBack()
+                        },
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) { Text("تجاهل التغييرات") }
+                    TextButton(onClick = { showExitConfirmDialog = false }) { Text(strings.cancel) }
+                }
+            }
+        )
+    }
+
+    if (showSaveAsDialog) {
+        val ext = file.extension.ifEmpty { "docx" }
+        var newName by remember { mutableStateOf("${file.nameWithoutExtension}_copy.$ext") }
+        AlertDialog(
+            onDismissRequest = { showSaveAsDialog = false },
+            title = { Text("حفظ باسم") },
+            text = {
+                OutlinedTextField(
+                    value = newName,
+                    onValueChange = { newName = it },
+                    label = { Text("اسم الملف الجديد") },
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val targetName = if (newName.contains('.')) newName else "$newName.$ext"
+                    showSaveAsDialog = false
+                    scope.launch(Dispatchers.IO) {
+                        val dest = FileUtils.ensureUniqueFile(file.parentFile!!, targetName)
+                        val res = WordEngine.saveDocument(dest, doc, context)
+                        withContext(Dispatchers.Main) {
+                            if (res is SafeSaveResult.Success) {
+                                repository.registerOrUpdateFile(res.savedFile, markOpened = false)
+                                statusToast = "تم الحفظ باسم ${res.savedFile.name}"
+                            } else if (res is SafeSaveResult.Failure) {
+                                statusToast = res.message
+                            }
+                        }
+                    }
+                }) { Text(strings.save) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSaveAsDialog = false }) { Text(strings.cancel) }
             }
         )
     }

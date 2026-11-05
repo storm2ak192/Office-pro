@@ -1,19 +1,22 @@
 package com.example.engine
 
+import android.content.Context
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import android.text.TextPaint
+import com.example.core.DetectedFormat
+import com.example.core.DocumentDetector
+import com.example.core.OoxmlPackage
+import com.example.core.SafeSaveManager
+import com.example.core.SafeSaveResult
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
-import java.util.zip.ZipOutputStream
 
 @Serializable
 enum class CellNumberFormat { GENERAL, CURRENCY, PERCENT, DATE }
@@ -85,31 +88,44 @@ data class ExcelSheet(
 data class ExcelWorkbookModel(
     val title: String = "جدول جديد",
     val sheets: List<ExcelSheet> = listOf(ExcelSheet()),
-    val activeSheetIndex: Int = 0
+    val activeSheetIndex: Int = 0,
+    val isReadOnlyBinary: Boolean = false,
+    @Transient val sourcePackage: OoxmlPackage? = null
 )
 
 object ExcelEngine {
 
     fun loadWorkbook(file: File): ExcelWorkbookModel {
-        val wb = when (file.extension.lowercase()) {
-            "xlsx" -> readXlsx(file)
-            "csv" -> readCsv(file)
-            "xls" -> readLegacyXls(file)
+        val detected = DocumentDetector.detect(file).format
+        val wb = when (detected) {
+            DetectedFormat.XLSX, DetectedFormat.XLSM -> readXlsx(file)
+            DetectedFormat.ODS -> readOds(file)
+            DetectedFormat.CSV -> readCsv(file)
+            DetectedFormat.XLS -> readLegacyXls(file, isBinaryXlsb = false)
+            DetectedFormat.XLSB -> readLegacyXls(file, isBinaryXlsb = true)
             else -> readCsv(file)
         }
         return wb.copy(sheets = wb.sheets.map { FormulaEvaluator.recalculateSheet(it) })
     }
 
-    fun saveWorkbook(file: File, workbook: ExcelWorkbookModel) {
-        when (file.extension.lowercase()) {
-            "xlsx" -> writeXlsx(file, workbook)
-            "csv" -> writeCsv(file, workbook.sheets.getOrElse(workbook.activeSheetIndex) { workbook.sheets.first() })
-            else -> writeXlsx(file, workbook)
+    fun saveWorkbook(file: File, workbook: ExcelWorkbookModel, context: Context? = null): SafeSaveResult {
+        val ext = file.extension.lowercase()
+        val validator: ((File) -> Boolean)? = when (ext) {
+            "xlsx", "xlsm", "ods" -> { f -> OoxmlPackage.isValidZip(f) }
+            else -> null
+        }
+        return SafeSaveManager.saveAtomically(file, context, validator) { tempOut ->
+            when (ext) {
+                "xlsx", "xlsm" -> writeXlsx(tempOut, workbook)
+                "ods" -> writeOds(tempOut, workbook)
+                "csv" -> writeCsv(tempOut, workbook.sheets.getOrElse(workbook.activeSheetIndex) { workbook.sheets.first() })
+                else -> writeXlsx(tempOut, workbook)
+            }
         }
     }
 
     private fun readCsv(file: File): ExcelWorkbookModel {
-        val text = file.readText(Charsets.UTF_8).removePrefix("\uFEFF")
+        val text = if (file.exists()) file.readText(Charsets.UTF_8).removePrefix("\uFEFF") else ""
         val lines = text.lines().filter { it.isNotEmpty() }
         val cells = mutableMapOf<String, ExcelCell>()
         var maxCols = 8
@@ -161,7 +177,7 @@ object ExcelEngine {
     }
 
     private fun writeCsv(file: File, sheet: ExcelSheet) {
-        val sb = StringBuilder("\uFEFF") // UTF-8 BOM for Arabic Excel
+        val sb = StringBuilder("\uFEFF")
         val maxRow = sheet.cells.keys.mapNotNull { it.split(",")[0].toIntOrNull() }.maxOrNull() ?: 0
         val maxCol = sheet.cells.keys.mapNotNull { it.split(",")[1].toIntOrNull() }.maxOrNull() ?: 0
         for (r in 0..maxRow) {
@@ -176,7 +192,7 @@ object ExcelEngine {
         file.writeText(sb.toString(), Charsets.UTF_8)
     }
 
-    private fun readLegacyXls(file: File): ExcelWorkbookModel {
+    private fun readLegacyXls(file: File, isBinaryXlsb: Boolean): ExcelWorkbookModel {
         val bytes = file.readBytes()
         val strings = mutableListOf<String>()
         val sb = StringBuilder()
@@ -195,40 +211,131 @@ object ExcelEngine {
             }
         }
         val cells = mutableMapOf<String, ExcelCell>()
-        strings.take(100).forEachIndexed { idx, s ->
+        strings.take(200).forEachIndexed { idx, s ->
             cells[FormulaEvaluator.cellKey(idx / 4, idx % 4)] = ExcelCell(rawInput = s, displayValue = s)
         }
         return ExcelWorkbookModel(
             title = file.nameWithoutExtension,
-            sheets = listOf(ExcelSheet(name = "ورقة 1", cells = cells))
+            sheets = listOf(ExcelSheet(name = "ورقة 1", cells = cells)),
+            isReadOnlyBinary = isBinaryXlsb
         )
     }
 
+    private fun readOds(file: File): ExcelWorkbookModel {
+        val pkg = OoxmlPackage.readFrom(file)
+        val sheets = mutableListOf<ExcelSheet>()
+        pkg.getEntry("content.xml")?.let { xmlBytes ->
+            val parser = XmlPullParserFactory.newInstance().newPullParser()
+            parser.setInput(xmlBytes.inputStream(), "UTF-8")
+            var currentSheetName = "ورقة 1"
+            var cells = mutableMapOf<String, ExcelCell>()
+            var rowIdx = -1
+            var colIdx = -1
+            var inTable = false
+            var event = parser.eventType
+            while (event != XmlPullParser.END_DOCUMENT) {
+                val tag = parser.name?.substringAfter(':') ?: ""
+                when (event) {
+                    XmlPullParser.START_TAG -> when (tag) {
+                        "table" -> {
+                            inTable = true
+                            currentSheetName = parser.getAttributeValue(null, "table:name")
+                                ?: parser.getAttributeValue(null, "name")
+                                ?: "ورقة ${sheets.size + 1}"
+                            cells = mutableMapOf()
+                            rowIdx = -1
+                        }
+                        "table-row" -> if (inTable) {
+                            rowIdx++
+                            colIdx = -1
+                        }
+                        "table-cell" -> if (inTable) {
+                            colIdx++
+                            val formula = parser.getAttributeValue(null, "table:formula")
+                                ?: parser.getAttributeValue(null, "formula")
+                            val valAttr = parser.getAttributeValue(null, "office:value")
+                                ?: parser.getAttributeValue(null, "value")
+                            if (!formula.isNullOrBlank()) {
+                                val cleanF = "=" + formula.substringAfter("of:=").removePrefix("=")
+                                cells[FormulaEvaluator.cellKey(rowIdx, colIdx)] = ExcelCell(rawInput = cleanF, displayValue = valAttr ?: cleanF)
+                            } else if (!valAttr.isNullOrBlank()) {
+                                cells[FormulaEvaluator.cellKey(rowIdx, colIdx)] = ExcelCell(rawInput = valAttr, displayValue = valAttr)
+                            }
+                        }
+                        "p" -> if (inTable && rowIdx >= 0 && colIdx >= 0) {
+                            val txt = parser.nextText()
+                            val key = FormulaEvaluator.cellKey(rowIdx, colIdx)
+                            val existing = cells[key]
+                            if (existing == null && txt.isNotEmpty()) {
+                                cells[key] = ExcelCell(rawInput = txt, displayValue = txt)
+                            } else if (existing != null && existing.rawInput.startsWith("=") && txt.isNotEmpty()) {
+                                cells[key] = existing.copy(displayValue = txt)
+                            }
+                        }
+                    }
+                    XmlPullParser.END_TAG -> if (tag == "table" && inTable) {
+                        inTable = false
+                        sheets.add(ExcelSheet(name = currentSheetName, rowCount = maxOf(30, rowIdx + 10), colCount = maxOf(12, colIdx + 5), cells = cells))
+                    }
+                }
+                event = parser.next()
+            }
+        }
+        if (sheets.isEmpty()) sheets.add(ExcelSheet())
+        return ExcelWorkbookModel(title = file.nameWithoutExtension, sheets = sheets, sourcePackage = pkg)
+    }
+
+    private fun writeOds(file: File, workbook: ExcelWorkbookModel) {
+        val pkg = workbook.sourcePackage?.copy() ?: OoxmlPackage()
+        if (!pkg.hasEntry("mimetype")) {
+            pkg.putEntry("mimetype", "application/vnd.oasis.opendocument.spreadsheet".toByteArray(Charsets.UTF_8))
+        }
+        val tablesXml = workbook.sheets.joinToString("\n") { sheet ->
+            val maxR = sheet.cells.keys.mapNotNull { it.split(",")[0].toIntOrNull() }.maxOrNull() ?: 0
+            val maxC = sheet.cells.keys.mapNotNull { it.split(",")[1].toIntOrNull() }.maxOrNull() ?: 0
+            val rowsXml = (0..maxR).joinToString("\n") { r ->
+                val cellsXml = (0..maxC).joinToString("") { c ->
+                    val cell = sheet.cells[FormulaEvaluator.cellKey(r, c)]
+                    if (cell == null || (cell.rawInput.isEmpty() && cell.displayValue.isEmpty())) {
+                        "<table:table-cell/>"
+                    } else if (cell.rawInput.startsWith("=")) {
+                        "<table:table-cell table:formula=\"of:${escapeXml(cell.rawInput)}\"><text:p>${escapeXml(cell.displayValue)}</text:p></table:table-cell>"
+                    } else {
+                        "<table:table-cell><text:p>${escapeXml(cell.displayValue)}</text:p></table:table-cell>"
+                    }
+                }
+                "      <table:table-row>$cellsXml</table:table-row>"
+            }
+            "    <table:table table:name=\"${escapeXml(sheet.name)}\">\n$rowsXml\n    </table:table>"
+        }
+        val contentXml = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2">
+  <office:body>
+    <office:spreadsheet>
+$tablesXml
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>"""
+        pkg.putEntry("content.xml", contentXml.toByteArray(Charsets.UTF_8))
+        pkg.writeTo(file)
+    }
+
     private fun readXlsx(file: File): ExcelWorkbookModel {
+        val pkg = OoxmlPackage.readFrom(file)
         val sharedStrings = mutableListOf<String>()
         val sheetNames = mutableListOf<String>()
         val sheetXmlMap = mutableMapOf<Int, ByteArray>()
 
-        ZipInputStream(FileInputStream(file)).use { zip ->
-            var entry: ZipEntry? = zip.nextEntry
-            while (entry != null) {
-                when {
-                    entry.name == "xl/sharedStrings.xml" -> {
-                        parseSharedStrings(zip.readBytes(), sharedStrings)
-                    }
-                    entry.name == "xl/workbook.xml" -> {
-                        parseWorkbookSheetNames(zip.readBytes(), sheetNames)
-                    }
-                    entry.name.startsWith("xl/worksheets/sheet") && entry.name.endsWith(".xml") -> {
-                        val num = entry.name.removePrefix("xl/worksheets/sheet")
-                            .removeSuffix(".xml").toIntOrNull() ?: (sheetXmlMap.size + 1)
-                        sheetXmlMap[num] = zip.readBytes()
-                    }
-                }
-                zip.closeEntry()
-                entry = zip.nextEntry
+        pkg.getEntry("xl/sharedStrings.xml")?.let { parseSharedStrings(it, sharedStrings) }
+        pkg.getEntry("xl/workbook.xml")?.let { parseWorkbookSheetNames(it, sheetNames) }
+
+        pkg.listEntries("xl/worksheets/sheet")
+            .filter { it.endsWith(".xml") }
+            .forEach { entryName ->
+                val num = entryName.removePrefix("xl/worksheets/sheet")
+                    .removeSuffix(".xml").toIntOrNull() ?: (sheetXmlMap.size + 1)
+                pkg.getEntry(entryName)?.let { sheetXmlMap[num] = it }
             }
-        }
 
         val sheets = mutableListOf<ExcelSheet>()
         val sortedKeys = sheetXmlMap.keys.sorted()
@@ -241,7 +348,11 @@ object ExcelEngine {
         if (sheets.isEmpty()) {
             sheets.add(ExcelSheet())
         }
-        return ExcelWorkbookModel(title = file.nameWithoutExtension, sheets = sheets)
+        return ExcelWorkbookModel(
+            title = file.nameWithoutExtension,
+            sheets = sheets,
+            sourcePackage = pkg
+        )
     }
 
     private fun parseSharedStrings(xmlBytes: ByteArray, out: MutableList<String>) {
@@ -294,6 +405,9 @@ object ExcelEngine {
         parser.setInput(xmlBytes.inputStream(), "UTF-8")
         val cells = mutableMapOf<String, ExcelCell>()
         val merged = mutableListOf<CellRange>()
+        val colWidths = mutableMapOf<Int, Float>()
+        var freezeRows = 0
+        var freezeCols = 0
 
         var currentRef: Pair<Int, Int>? = null
         var currentType = ""
@@ -308,6 +422,20 @@ object ExcelEngine {
             when (event) {
                 XmlPullParser.START_TAG -> {
                     when (tag) {
+                        "pane" -> {
+                            freezeRows = parser.getAttributeValue(null, "ySplit")?.toDoubleOrNull()?.toInt() ?: freezeRows
+                            freezeCols = parser.getAttributeValue(null, "xSplit")?.toDoubleOrNull()?.toInt() ?: freezeCols
+                        }
+                        "col" -> {
+                            val min = parser.getAttributeValue(null, "min")?.toIntOrNull()
+                            val max = parser.getAttributeValue(null, "max")?.toIntOrNull()
+                            val w = parser.getAttributeValue(null, "width")?.toFloatOrNull()
+                            if (min != null && max != null && w != null) {
+                                for (c in (min - 1)..(max - 1)) {
+                                    if (c >= 0) colWidths[c] = (w * 8f).coerceIn(50f, 320f)
+                                }
+                            }
+                        }
                         "c" -> {
                             val rStr = parser.getAttributeValue(null, "r") ?: ""
                             currentRef = FormulaEvaluator.parseCellRef(rStr)
@@ -366,7 +494,10 @@ object ExcelEngine {
             rowCount = maxR + 1,
             colCount = maxC + 1,
             cells = cells,
-            mergedRanges = merged
+            mergedRanges = merged,
+            columnWidths = colWidths,
+            freezeRows = freezeRows,
+            freezeCols = freezeCols
         )
     }
 
@@ -381,7 +512,6 @@ object ExcelEngine {
             }
         }
 
-        // Pre-intern all non-formula string values
         workbook.sheets.forEach { sheet ->
             sheet.cells.values.forEach { cell ->
                 if (!cell.rawInput.startsWith("=") && cell.rawInput.toDoubleOrNull() == null && cell.rawInput.isNotEmpty()) {
@@ -390,13 +520,14 @@ object ExcelEngine {
             }
         }
 
-        ZipOutputStream(FileOutputStream(file)).use { zip ->
-            // [Content_Types].xml
+        val pkg = workbook.sourcePackage?.copy() ?: OoxmlPackage()
+
+        if (!pkg.hasEntry("[Content_Types].xml")) {
             val sheetOverrides = workbook.sheets.indices.joinToString("\n") { i ->
                 """  <Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"""
             }
-            zip.putNextEntry(ZipEntry("[Content_Types].xml"))
-            zip.write(
+            pkg.putEntry(
+                "[Content_Types].xml",
                 """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
@@ -406,38 +537,38 @@ object ExcelEngine {
 $sheetOverrides
 </Types>""".toByteArray(Charsets.UTF_8)
             )
-            zip.closeEntry()
+        }
 
-            // _rels/.rels
-            zip.putNextEntry(ZipEntry("_rels/.rels"))
-            zip.write(
+        if (!pkg.hasEntry("_rels/.rels")) {
+            pkg.putEntry(
+                "_rels/.rels",
                 """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>""".toByteArray(Charsets.UTF_8)
             )
-            zip.closeEntry()
+        }
 
-            // xl/_rels/workbook.xml.rels
+        if (!pkg.hasEntry("xl/_rels/workbook.xml.rels")) {
             val sheetRels = workbook.sheets.indices.joinToString("\n") { i ->
                 """  <Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>"""
             }
-            zip.putNextEntry(ZipEntry("xl/_rels/workbook.xml.rels"))
-            zip.write(
+            pkg.putEntry(
+                "xl/_rels/workbook.xml.rels",
                 """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
 $sheetRels
   <Relationship Id="rIdStrings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
 </Relationships>""".toByteArray(Charsets.UTF_8)
             )
-            zip.closeEntry()
+        }
 
-            // xl/workbook.xml
+        if (!pkg.hasEntry("xl/workbook.xml")) {
             val sheetDefs = workbook.sheets.mapIndexed { i, s ->
                 """    <sheet name="${escapeXml(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>"""
             }.joinToString("\n")
-            zip.putNextEntry(ZipEntry("xl/workbook.xml"))
-            zip.write(
+            pkg.putEntry(
+                "xl/workbook.xml",
                 """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <sheets>
@@ -445,26 +576,25 @@ $sheetDefs
   </sheets>
 </workbook>""".toByteArray(Charsets.UTF_8)
             )
-            zip.closeEntry()
-
-            // xl/sharedStrings.xml
-            val siItems = sharedStrings.joinToString("") { s ->
-                "<si><t xml:space=\"preserve\">${escapeXml(s)}</t></si>"
-            }
-            zip.putNextEntry(ZipEntry("xl/sharedStrings.xml"))
-            zip.write(
-                """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${sharedStrings.size}" uniqueCount="${sharedStrings.size}">$siItems</sst>""".toByteArray(Charsets.UTF_8)
-            )
-            zip.closeEntry()
-
-            // xl/worksheets/sheet*.xml
-            workbook.sheets.forEachIndexed { idx, sheet ->
-                zip.putNextEntry(ZipEntry("xl/worksheets/sheet${idx + 1}.xml"))
-                zip.write(buildWorksheetXml(sheet, stringIndexMap).toByteArray(Charsets.UTF_8))
-                zip.closeEntry()
-            }
         }
+
+        val siItems = sharedStrings.joinToString("") { s ->
+            "<si><t xml:space=\"preserve\">${escapeXml(s)}</t></si>"
+        }
+        pkg.putEntry(
+            "xl/sharedStrings.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${sharedStrings.size}" uniqueCount="${sharedStrings.size}">$siItems</sst>""".toByteArray(Charsets.UTF_8)
+        )
+
+        workbook.sheets.forEachIndexed { idx, sheet ->
+            pkg.putEntry(
+                "xl/worksheets/sheet${idx + 1}.xml",
+                buildWorksheetXml(sheet, stringIndexMap).toByteArray(Charsets.UTF_8)
+            )
+        }
+
+        pkg.writeTo(file)
     }
 
     private fun buildWorksheetXml(sheet: ExcelSheet, stringMap: Map<String, Int>): String {
@@ -472,9 +602,28 @@ $sheetDefs
         sb.append(
             """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <sheetData>
 """
         )
+        if (sheet.freezeRows > 0 || sheet.freezeCols > 0) {
+            val topLeft = "${FormulaEvaluator.colIndexToName(sheet.freezeCols)}${sheet.freezeRows + 1}"
+            sb.append(
+                """  <sheetViews>
+    <sheetView workbookViewId="0">
+      <pane xSplit="${sheet.freezeCols}" ySplit="${sheet.freezeRows}" topLeftCell="$topLeft" activePane="bottomRight" state="frozen"/>
+    </sheetView>
+  </sheetViews>
+"""
+            )
+        }
+        if (sheet.columnWidths.isNotEmpty()) {
+            sb.append("  <cols>\n")
+            sheet.columnWidths.forEach { (colIdx, widthPx) ->
+                val excelW = (widthPx / 8f).coerceIn(6f, 60f)
+                sb.append("    <col min=\"${colIdx + 1}\" max=\"${colIdx + 1}\" width=\"$excelW\" customWidth=\"1\"/>\n")
+            }
+            sb.append("  </cols>\n")
+        }
+        sb.append("  <sheetData>\n")
         val rowsMap = sortedMapOf<Int, MutableList<Pair<Int, ExcelCell>>>()
         sheet.cells.forEach { (key, cell) ->
             val parts = key.split(",")
